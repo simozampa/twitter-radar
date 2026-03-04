@@ -23,64 +23,18 @@ apify:
   # How many accounts to scrape per scan (rotates through full list)
   accounts_per_scan: 50
 
-# Communities to track
-# Each community has priority accounts (Twitter API) and search queries (Apify)
-communities:
-  ai:
-    name: "AI / Machine Learning"
-    enabled: true
-    # Search queries — used by Apify for broad discovery (free)
-    queries:
-      - "AI artificial intelligence LLM GPT Claude"
-      - "AGI superintelligence AI safety"
-      - "OpenAI Anthropic DeepMind Google AI"
-    # Priority accounts — monitored via Twitter API timelines (credit-efficient)
-    priority_accounts:
-      - "sama"           # Sam Altman
-      - "ylecun"         # Yann LeCun
-      - "AnthropicAI"    # Anthropic
-      - "GoogleDeepMind" # DeepMind
-      - "elonmusk"
-      - "DrJimFan"       # Jim Fan
-      - "swyx"           # Swyx
-      - "karpathy"       # Andrej Karpathy
-      - "OpenAI"
-    min_likes: 10
-    min_retweets: 3
-
-  crypto:
-    name: "Crypto / Web3"
-    enabled: true
-    queries:
-      - "crypto bitcoin ethereum solana"
-      - "DeFi DEX onchain memecoin"
-      - "airdrop token launch TGE"
-    priority_accounts:
-      - "VitalikButerin"
-      - "blknoiz06"
-      - "CryptoHayes"    # Arthur Hayes
-      - "HsakaTrades"
-      - "MustStopMurad"
-      - "DefiIgnas"
-      - "inversebrah"
-      - "ZssBecker"
-      - "gainzy222"
-      - "jonwu_"
-    min_likes: 10
-    min_retweets: 3
-
-  tech:
-    name: "Tech / Startups"
-    enabled: false
-    queries:
-      - "startup YC venture capital Series A"
-      - "SaaS developer tools open source"
-    priority_accounts:
-      - "paulg"
-      - "garrytan"
-      - "levelsio"
-    min_likes: 10
-    min_retweets: 3
+# Scraping strategy: pull tweets from ALL accounts you follow,
+# let trend detection cluster topics automatically.
+# No manual categorization needed.
+following:
+  # Your Twitter username (used to pull following list)
+  username: "zampa0x"
+  # How many accounts to scrape per scan (rotates through full list)
+  accounts_per_scan: 100
+  # Minimum followers to include (filters out bots/dead accounts)
+  min_followers: 1000
+  # How often to refresh the following list (hours)
+  refresh_interval_hours: 168  # weekly
 
 # Trend detection settings
 detection:
