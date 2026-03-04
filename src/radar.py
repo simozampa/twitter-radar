@@ -19,6 +19,7 @@ from .twitter_client import TwitterClient
 from .apify_client import ApifyTwitterClient
 from .trend_detector import TrendDetector, compute_engagement_score
 from .draft_generator import build_trend_context, generate_draft_prompt, format_drafts_for_alert
+from .following_manager import FollowingManager
 
 logger = logging.getLogger("twitter_radar")
 
@@ -54,6 +55,9 @@ class TwitterRadar:
 
         # --- Trend detector ---
         self.detector = TrendDetector(self.config['detection'])
+
+        # --- Following manager ---
+        self.following = FollowingManager(str(Path(db_path).parent))
 
         # --- Resolved user IDs cache (file-backed) ---
         self._data_dir = Path(db_path).parent
@@ -210,39 +214,62 @@ class TwitterRadar:
 
     def fetch_apify(self, community_name: str, community_config: dict) -> list:
         """
-        Fetch tweets via Apify for broad discovery.
+        Fetch tweets via Apify from accounts in following list.
+        Scrapes YOUR feed, not random keyword garbage.
         No Twitter API credits consumed.
         """
         if not self.apify:
-            logger.warning("Apify not configured, skipping broad search")
+            logger.warning("Apify not configured, skipping")
             return []
 
-        queries = community_config.get('queries', [])
-        if not queries:
-            return []
+        # Get accounts from following list for this community
+        following_accounts = self.following.get_accounts_for_community(community_name)
 
-        max_tweets = self.config.get('apify', {}).get('max_tweets_per_query', 100)
-
-        # Search for top tweets (engagement-sorted)
-        tweets = self.apify.search_tweets(
-            queries=queries,
-            max_tweets=max_tweets * len(queries),
-            since_hours=self.config['detection']['baseline_window_hours'],
-            sort_by="Top"
-        )
-
-        # Tag with community and priority status
-        priority_usernames = set(
+        # Also include priority accounts from config (manual overrides)
+        priority_accounts = [
             u.lower() for u in community_config.get('priority_accounts', [])
+        ]
+        all_accounts = list(set(following_accounts + priority_accounts))
+
+        if not all_accounts:
+            # Fallback to keyword search if no following data
+            logger.info(f"[{community_name}] No following data, falling back to keyword search")
+            queries = community_config.get('queries', [])
+            if queries:
+                max_tweets = self.config.get('apify', {}).get('max_tweets_per_query', 100)
+                tweets = self.apify.search_tweets(queries=queries, max_tweets=max_tweets, sort_by="Top")
+                for t in tweets:
+                    t['community'] = community_name
+                if tweets:
+                    self.db.upsert_tweets_batch(tweets)
+                return tweets
+            return []
+
+        # Get rotation batch (scrape subset each run to manage costs)
+        batch_size = self.config.get('apify', {}).get('accounts_per_scan', 50)
+        rotation_idx = self._rotation.get(f"{community_name}_apify", 0)
+        batch = self.following.get_batch_for_scraping(
+            community_name, batch_size, rotation_idx
         )
+        self._rotation[f"{community_name}_apify"] = rotation_idx + 1
+        self._save_rotation()
+
+        logger.info(f"[{community_name}] Scraping {len(batch)}/{len(all_accounts)} "
+                    f"accounts from your following (rotation {rotation_idx})")
+
+        max_tweets = self.config.get('apify', {}).get('max_tweets_per_query', 200)
+        tweets = self.apify.scrape_user_tweets(batch, max_tweets=max_tweets)
+
+        # Tag with community and priority
+        priority_set = set(priority_accounts)
         for t in tweets:
             t['community'] = community_name
-            t['is_priority_account'] = t.get('author_username', '').lower() in priority_usernames
+            t['is_priority_account'] = t.get('author_username', '').lower() in priority_set
 
         if tweets:
             self.db.upsert_tweets_batch(tweets)
 
-        logger.info(f"[{community_name}] Apify: {len(tweets)} tweets from broad search")
+        logger.info(f"[{community_name}] Apify: {len(tweets)} tweets from following list")
         return tweets
 
     def detect_trends_for_community(self, name: str, all_tweets: list) -> list:

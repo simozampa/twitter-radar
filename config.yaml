@@ -15,11 +15,13 @@ twitter:
   search_rate_limit: 280
   poll_interval_minutes: 15
 
-# Apify (broad discovery, no Twitter API credit cost)
+# Apify (scrapes tweets from your following list — no Twitter API credits)
 apify:
   api_token: "${APIFY_API_TOKEN}"
-  # Max tweets per query via Apify
-  max_tweets_per_query: 100
+  # Max tweets per Apify scrape batch
+  max_tweets_per_query: 200
+  # How many accounts to scrape per scan (rotates through full list)
+  accounts_per_scan: 50
 
 # Communities to track
 # Each community has priority accounts (Twitter API) and search queries (Apify)

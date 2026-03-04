@@ -140,28 +140,42 @@ class ApifyTwitterClient:
 
         return results
 
-    def scrape_user_tweets(self, usernames: list[str], max_tweets_per_user: int = 20,
+    def scrape_user_tweets(self, usernames: list[str], max_tweets: int = 200,
                            since_hours: float = 24) -> list:
         """
         Scrape tweets from specific users via Apify.
+        Uses Twitter search with from: operators.
         No Twitter API credits consumed.
         """
-        # Build handles list
-        handles = [u if u.startswith("@") else f"@{u}" for u in usernames]
+        # Build search queries using from: operator
+        # Twitter search supports OR-ing multiple from: 
+        # But we need to batch them (queries can get too long)
+        batch_size = 10  # 10 users per query
+        all_tweets = []
 
-        input_data = {
-            "handles": handles,
-            "maxTweets": max_tweets_per_user * len(handles),
-            "sort": "Latest",
-        }
+        for i in range(0, len(usernames), batch_size):
+            batch = usernames[i:i + batch_size]
+            from_query = " OR ".join(f"from:{u}" for u in batch)
+            search_terms = [f"({from_query}) -is:reply"]
 
-        try:
-            raw_results = self._run_actor(ACTORS["tweet_scraper"], input_data)
-        except Exception as e:
-            logger.error(f"Apify user scrape failed: {e}")
-            return []
+            input_data = {
+                "searchTerms": search_terms,
+                "sort": "Top",
+                "maxItems": max_tweets,
+            }
 
-        return self._normalize_tweets(raw_results)
+            try:
+                raw_results = self._run_actor(ACTORS["tweet_scraper"], input_data)
+                if raw_results:
+                    tweets = self._normalize_tweets(raw_results)
+                    all_tweets.extend(tweets)
+                    logger.info(f"Scraped {len(tweets)} tweets from batch "
+                               f"{i//batch_size + 1} ({len(batch)} users)")
+            except Exception as e:
+                logger.error(f"Apify user batch scrape failed: {e}")
+                continue
+
+        return all_tweets
 
     def _normalize_tweets(self, raw_tweets: list) -> list:
         """
