@@ -1,0 +1,119 @@
+# Twitter Trend Radar - Configuration
+# =====================================
+
+twitter:
+  # Your Twitter API Bearer Token (Pro plan $200/mo)
+  bearer_token: "${TWITTER_BEARER_TOKEN}"
+  
+  # Rate limiting (Pro plan: 300 requests/15min for search)
+  search_rate_limit: 280  # stay under ceiling
+  poll_interval_minutes: 15
+
+# Communities to track
+# Each community has a name, search queries, and optional accounts to monitor
+communities:
+  ai:
+    name: "AI / Machine Learning"
+    enabled: true
+    queries:
+      - "(AI OR artificial intelligence OR LLM OR GPT OR Claude) -is:retweet lang:en"
+      - "(machine learning OR deep learning OR neural network) -is:retweet lang:en"
+      - "(AGI OR superintelligence OR AI safety) -is:retweet lang:en"
+    # High-signal accounts to weight more heavily
+    priority_accounts:
+      - "sama"          # Sam Altman
+      - "ylecun"        # Yann LeCun
+      - "kaborgo"       # Anthropic
+      - "demaborgo"     # DeepMind
+      - "elonmusk"
+      - "jimfan_"       # Jim Fan
+      - "DrJimFan"
+      - "emaborogo"     # Emad
+      - "swaborgo"      # Swyx
+      - "ai_explained_"
+    # Minimum engagement threshold to consider a tweet "hot"
+    min_likes: 50
+    min_retweets: 10
+
+  crypto:
+    name: "Crypto / Web3"
+    enabled: true
+    queries:
+      - "(crypto OR bitcoin OR ethereum OR solana) -is:retweet lang:en"
+      - "(DeFi OR DEX OR onchain OR memecoin) -is:retweet lang:en"
+      - "(airdrop OR token launch OR TGE) -is:retweet lang:en"
+    priority_accounts:
+      - "VitalikButerin"
+      - "aaborgo"       # Ansem
+      - "blknoiz06"
+      - "CryptoHayes"   # Arthur Hayes
+      - "coaborgo"      # Cobie
+      - "HsakaTrades"
+      - "MustStopMurad"
+      - "SBF_FTX"
+      - "DefiIgnas"
+      - "pentaborgo"    # Pentoshi
+    min_likes: 100
+    min_retweets: 20
+
+  tech:
+    name: "Tech / Startups"
+    enabled: false
+    queries:
+      - "(startup OR YC OR venture capital OR Series A) -is:retweet lang:en"
+      - "(SaaS OR developer tools OR open source) -is:retweet lang:en"
+    priority_accounts:
+      - "paulg"
+      - "garrytan"
+      - "pmaborgo"      # pmarca
+    min_likes: 50
+    min_retweets: 10
+
+# Trend detection settings
+detection:
+  # How far back to look for baseline engagement (hours)
+  baseline_window_hours: 24
+  # How far back for "current" trending window (hours)
+  trending_window_hours: 2
+  # Minimum velocity score to flag as trending (engagement acceleration)
+  min_velocity_score: 3.0
+  # Maximum number of trends to report per community
+  max_trends_per_community: 5
+  # Deduplicate similar topics (cosine similarity threshold)
+  dedup_similarity_threshold: 0.75
+
+# Alert settings
+alerts:
+  # How often to send trend digests (minutes)
+  digest_interval_minutes: 60
+  # Only alert if velocity exceeds this (higher = fewer, hotter alerts)
+  alert_velocity_threshold: 5.0
+  # Quiet hours (no alerts unless velocity > 10)
+  quiet_hours:
+    start: 23  # 11 PM
+    end: 8     # 8 AM
+    timezone: "America/Los_Angeles"
+  # Include draft takes in alerts
+  include_drafts: true
+  # Number of draft takes per trend
+  drafts_per_trend: 2
+
+# Draft generation
+drafts:
+  # Styles of content to generate
+  styles:
+    - name: "hot_take"
+      description: "Spicy, opinionated take. 1-3 tweets max."
+      max_length: 800
+    - name: "thread"
+      description: "Informative thread breaking down the trend. 5-8 tweets."
+      max_length: 2000
+    - name: "article_outline"
+      description: "Blog post / article outline with key points."
+      max_length: 1500
+
+# Storage
+storage:
+  db_path: "data/twitter_radar.db"
+  # Keep raw tweet data for N days
+  retention_days: 30
