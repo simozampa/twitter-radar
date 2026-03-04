@@ -1,6 +1,6 @@
 """
 Twitter API v2 client for Trend Radar.
-Handles authentication, search, rate limiting.
+Focused on user timelines (not search) to conserve credits.
 """
 
 import os
@@ -15,6 +15,38 @@ logger = logging.getLogger("twitter_radar.client")
 API_BASE = "https://api.twitter.com/2"
 
 
+class CreditTracker:
+    """Track API credit usage to avoid blowing the budget."""
+
+    def __init__(self, monthly_limit: int = 15000):
+        self.monthly_limit = monthly_limit
+        self.used = 0
+        self.reset_month = datetime.now(timezone.utc).month
+
+    def _check_reset(self):
+        current_month = datetime.now(timezone.utc).month
+        if current_month != self.reset_month:
+            self.used = 0
+            self.reset_month = current_month
+
+    def consume(self, count: int):
+        self._check_reset()
+        self.used += count
+        remaining = self.monthly_limit - self.used
+        logger.info(f"Credits: used {count}, total {self.used}/{self.monthly_limit} ({remaining} remaining)")
+        if remaining < 1000:
+            logger.warning(f"⚠️ Low credits! Only {remaining} remaining this month")
+
+    def can_afford(self, count: int) -> bool:
+        self._check_reset()
+        return (self.used + count) <= self.monthly_limit
+
+    @property
+    def remaining(self) -> int:
+        self._check_reset()
+        return self.monthly_limit - self.used
+
+
 class RateLimiter:
     """Simple sliding-window rate limiter."""
 
@@ -25,7 +57,6 @@ class RateLimiter:
 
     def wait_if_needed(self):
         now = time.time()
-        # Purge old entries
         self.requests = [t for t in self.requests if now - t < self.window_seconds]
         if len(self.requests) >= self.max_requests:
             sleep_time = self.requests[0] + self.window_seconds - now + 1
@@ -36,7 +67,8 @@ class RateLimiter:
 
 
 class TwitterClient:
-    def __init__(self, bearer_token: str, rate_limit: int = 280):
+    def __init__(self, bearer_token: str, monthly_credit_limit: int = 15000,
+                 rate_limit: int = 280):
         self.bearer_token = bearer_token
         self.session = requests.Session()
         self.session.headers.update({
@@ -44,6 +76,7 @@ class TwitterClient:
             "User-Agent": "TwitterRadar/1.0"
         })
         self.limiter = RateLimiter(rate_limit, 900)
+        self.credits = CreditTracker(monthly_credit_limit)
 
     def _get(self, endpoint: str, params: dict) -> dict:
         """Make a rate-limited GET request."""
@@ -64,110 +97,53 @@ class TwitterClient:
 
         return resp.json()
 
-    def search_recent(
-        self,
-        query: str,
-        max_results: int = 100,
-        since_hours: float = 2,
-        next_token: Optional[str] = None
-    ) -> dict:
+    def lookup_users_by_username(self, usernames: list[str]) -> dict:
         """
-        Search recent tweets (last 7 days max on Pro plan).
-        Returns dict with 'tweets' list and optional 'next_token'.
+        Resolve usernames to user IDs.
+        Returns {username_lower: {id, username, ...}}.
+        Cost: 1 request per 100 usernames (doesn't count against tweet credits).
         """
+        results = {}
+        for i in range(0, len(usernames), 100):
+            batch = usernames[i:i + 100]
+            params = {
+                "usernames": ",".join(batch),
+                "user.fields": "id,username,public_metrics,verified,description"
+            }
+            data = self._get("users/by", params)
+            for u in data.get("data", []):
+                results[u["username"].lower()] = u
+            errors = data.get("errors", [])
+            for e in errors:
+                logger.warning(f"User lookup error: {e.get('detail', e)}")
+
+        return results
+
+    def get_user_timeline(self, user_id: str, max_results: int = 10,
+                          since_hours: float = 24) -> list:
+        """
+        Get recent tweets from a specific user's timeline.
+        Cost: each tweet returned counts against credits.
+        """
+        if not self.credits.can_afford(max_results):
+            logger.warning(f"Skipping timeline for {user_id}: insufficient credits "
+                          f"({self.credits.remaining} remaining)")
+            return []
+
         start_time = datetime.now(timezone.utc) - timedelta(hours=since_hours)
 
         params = {
-            "query": query,
-            "max_results": min(max_results, 100),
-            "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "tweet.fields": "created_at,public_metrics,author_id,conversation_id,context_annotations,entities",
-            "user.fields": "username,public_metrics,verified",
-            "expansions": "author_id",
-            "sort_order": "relevancy"
-        }
-
-        if next_token:
-            params["next_token"] = next_token
-
-        data = self._get("tweets/search/recent", params)
-
-        # Parse users into a lookup
-        users = {}
-        if "includes" in data and "users" in data["includes"]:
-            for u in data["includes"]["users"]:
-                users[u["id"]] = u
-
-        tweets = []
-        for t in data.get("data", []):
-            metrics = t.get("public_metrics", {})
-            author = users.get(t["author_id"], {})
-            tweets.append({
-                "tweet_id": t["id"],
-                "author_id": t["author_id"],
-                "author_username": author.get("username", "unknown"),
-                "author_followers": author.get("public_metrics", {}).get("followers_count", 0),
-                "text": t["text"],
-                "created_at": t["created_at"],
-                "likes": metrics.get("like_count", 0),
-                "retweets": metrics.get("retweet_count", 0),
-                "replies": metrics.get("reply_count", 0),
-                "quotes": metrics.get("quote_count", 0),
-                "impressions": metrics.get("impression_count", 0),
-                "entities": t.get("entities", {}),
-                "context_annotations": t.get("context_annotations", []),
-            })
-
-        result = {"tweets": tweets}
-        meta = data.get("meta", {})
-        if "next_token" in meta:
-            result["next_token"] = meta["next_token"]
-        result["result_count"] = meta.get("result_count", len(tweets))
-
-        return result
-
-    def search_all_pages(
-        self,
-        query: str,
-        max_total: int = 500,
-        since_hours: float = 2
-    ) -> list:
-        """Paginate through search results up to max_total tweets."""
-        all_tweets = []
-        next_token = None
-
-        while len(all_tweets) < max_total:
-            remaining = max_total - len(all_tweets)
-            batch_size = min(remaining, 100)
-
-            result = self.search_recent(
-                query=query,
-                max_results=batch_size,
-                since_hours=since_hours,
-                next_token=next_token
-            )
-
-            all_tweets.extend(result["tweets"])
-            next_token = result.get("next_token")
-
-            if not next_token or result["result_count"] == 0:
-                break
-
-            logger.debug(f"Fetched {len(all_tweets)}/{max_total} tweets")
-
-        return all_tweets
-
-    def get_user_tweets(self, user_id: str, max_results: int = 10, since_hours: float = 24) -> list:
-        """Get recent tweets from a specific user."""
-        start_time = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-
-        params = {
-            "max_results": min(max_results, 100),
+            "max_results": max(min(max_results, 100), 5),  # API min is 5
             "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "tweet.fields": "created_at,public_metrics,conversation_id,entities",
+            "exclude": "replies",  # Only original tweets, not replies
         }
 
-        data = self._get(f"users/{user_id}/tweets", params)
+        try:
+            data = self._get(f"users/{user_id}/tweets", params)
+        except requests.HTTPError as e:
+            logger.error(f"Timeline fetch failed for {user_id}: {e}")
+            return []
 
         tweets = []
         for t in data.get("data", []):
@@ -184,20 +160,31 @@ class TwitterClient:
                 "impressions": metrics.get("impression_count", 0),
             })
 
+        self.credits.consume(len(tweets))
         return tweets
 
-    def lookup_users_by_username(self, usernames: list[str]) -> dict:
-        """Resolve usernames to user IDs. Returns {username: {id, ...}}."""
-        results = {}
-        # API allows up to 100 usernames per request
-        for i in range(0, len(usernames), 100):
-            batch = usernames[i:i + 100]
-            params = {
-                "usernames": ",".join(batch),
-                "user.fields": "id,username,public_metrics,verified,description"
-            }
-            data = self._get("users/by", params)
-            for u in data.get("data", []):
-                results[u["username"].lower()] = u
+    def get_timelines_batch(self, user_ids: dict, max_per_user: int = 10,
+                            since_hours: float = 24) -> list:
+        """
+        Fetch timelines for multiple users efficiently.
+        user_ids: {user_id: username}
+        Returns all tweets with author_username attached.
+        """
+        all_tweets = []
 
-        return results
+        for user_id, username in user_ids.items():
+            if not self.credits.can_afford(5):  # minimum per request
+                logger.warning(f"Stopping timeline fetches: credits exhausted "
+                              f"({self.credits.remaining} remaining)")
+                break
+
+            tweets = self.get_user_timeline(user_id, max_per_user, since_hours)
+            for t in tweets:
+                t['author_username'] = username
+                t['is_priority_account'] = True
+            all_tweets.extend(tweets)
+
+            logger.info(f"@{username}: {len(tweets)} tweets "
+                       f"(credits remaining: {self.credits.remaining})")
+
+        return all_tweets

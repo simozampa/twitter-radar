@@ -1,6 +1,8 @@
 """
 Main Twitter Radar engine.
-Orchestrates fetching, trend detection, and alert formatting.
+Two-pronged strategy:
+  1. Twitter API: Monitor specific high-value account timelines (precise, credit-conscious)
+  2. Apify: Broad search + trend discovery (no Twitter credit cost)
 """
 
 import os
@@ -14,6 +16,7 @@ from typing import Optional
 
 from .db import Database
 from .twitter_client import TwitterClient
+from .apify_client import ApifyTwitterClient
 from .trend_detector import TrendDetector, compute_engagement_score
 from .draft_generator import build_trend_context, generate_draft_prompt, format_drafts_for_alert
 
@@ -28,154 +31,240 @@ class TwitterRadar:
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
-        # Resolve bearer token from env if needed
-        token = self.config['twitter']['bearer_token']
-        if token.startswith("${") and token.endswith("}"):
-            env_var = token[2:-1]
-            token = os.environ.get(env_var, "")
-            if not token:
-                raise ValueError(f"Environment variable {env_var} not set")
+        # --- Twitter API client (for timelines) ---
+        self.twitter = None
+        token = self._resolve_env(self.config['twitter'].get('bearer_token', ''))
+        if token:
+            self.twitter = TwitterClient(
+                bearer_token=token,
+                monthly_credit_limit=self.config['twitter'].get('monthly_credit_limit', 15000),
+                rate_limit=self.config['twitter'].get('search_rate_limit', 280)
+            )
 
-        self.client = TwitterClient(
-            bearer_token=token,
-            rate_limit=self.config['twitter'].get('search_rate_limit', 280)
-        )
+        # --- Apify client (for broad discovery) ---
+        self.apify = None
+        apify_token = self._resolve_env(self.config.get('apify', {}).get('api_token', ''))
+        if apify_token:
+            self.apify = ApifyTwitterClient(api_token=apify_token)
 
+        # --- Database ---
         db_path = self.config['storage']['db_path']
         if not os.path.isabs(db_path):
             db_path = str(Path(__file__).parent.parent / db_path)
         self.db = Database(db_path)
 
+        # --- Trend detector ---
         self.detector = TrendDetector(self.config['detection'])
 
+        # --- Resolved user IDs cache ---
+        self._user_id_cache: dict = {}
+
+    @staticmethod
+    def _resolve_env(value: str) -> str:
+        """Resolve ${ENV_VAR} references."""
+        if value and value.startswith("${") and value.endswith("}"):
+            return os.environ.get(value[2:-1], "")
+        return value
+
     def get_enabled_communities(self) -> dict:
-        """Get all enabled community configs."""
         return {
             name: cfg for name, cfg in self.config['communities'].items()
             if cfg.get('enabled', True)
         }
 
-    def fetch_community(self, name: str, community_config: dict) -> list:
-        """Fetch tweets for a community and store them."""
-        all_tweets = []
+    def _resolve_user_ids(self, usernames: list[str]) -> dict:
+        """
+        Resolve usernames to Twitter user IDs.
+        Uses cache to avoid repeated lookups.
+        Returns {user_id: username}.
+        """
+        if not self.twitter:
+            return {}
+
+        # Filter out already-cached
+        to_resolve = [u for u in usernames if u.lower() not in self._user_id_cache]
+
+        if to_resolve:
+            resolved = self.twitter.lookup_users_by_username(to_resolve)
+            for username_lower, user_data in resolved.items():
+                self._user_id_cache[username_lower] = user_data['id']
+                logger.info(f"Resolved @{username_lower} → {user_data['id']}")
+
+        # Build {id: username} mapping
+        result = {}
+        for u in usernames:
+            uid = self._user_id_cache.get(u.lower())
+            if uid:
+                result[uid] = u
+            else:
+                logger.warning(f"Could not resolve @{u}")
+
+        return result
+
+    def fetch_timelines(self, community_name: str, community_config: dict) -> list:
+        """
+        Fetch tweets from priority accounts via Twitter API timelines.
+        Very credit-efficient: only reads from accounts we care about.
+        """
+        if not self.twitter:
+            logger.warning("Twitter API not configured, skipping timelines")
+            return []
+
+        accounts = community_config.get('priority_accounts', [])
+        if not accounts:
+            return []
+
+        # Resolve usernames to IDs
+        user_ids = self._resolve_user_ids(accounts)
+        if not user_ids:
+            return []
+
+        max_per_user = self.config['twitter'].get('max_tweets_per_user', 10)
+        since_hours = self.config['detection']['baseline_window_hours']
+
+        tweets = self.twitter.get_timelines_batch(user_ids, max_per_user, since_hours)
+
+        # Tag with community
+        for t in tweets:
+            t['community'] = community_name
+            t['is_priority_account'] = True
+
+        if tweets:
+            self.db.upsert_tweets_batch(tweets)
+
+        logger.info(f"[{community_name}] Timelines: {len(tweets)} tweets from "
+                    f"{len(user_ids)} accounts (credits remaining: "
+                    f"{self.twitter.credits.remaining})")
+
+        return tweets
+
+    def fetch_apify(self, community_name: str, community_config: dict) -> list:
+        """
+        Fetch tweets via Apify for broad discovery.
+        No Twitter API credits consumed.
+        """
+        if not self.apify:
+            logger.warning("Apify not configured, skipping broad search")
+            return []
+
+        queries = community_config.get('queries', [])
+        if not queries:
+            return []
+
+        max_tweets = self.config.get('apify', {}).get('max_tweets_per_query', 100)
+
+        # Search for top tweets (engagement-sorted)
+        tweets = self.apify.search_tweets(
+            queries=queries,
+            max_tweets=max_tweets * len(queries),
+            since_hours=self.config['detection']['baseline_window_hours'],
+            sort_by="Top"
+        )
+
+        # Tag with community and priority status
         priority_usernames = set(
             u.lower() for u in community_config.get('priority_accounts', [])
         )
-        min_likes = community_config.get('min_likes', 0)
-        min_rts = community_config.get('min_retweets', 0)
+        for t in tweets:
+            t['community'] = community_name
+            t['is_priority_account'] = t.get('author_username', '').lower() in priority_usernames
 
-        for query in community_config.get('queries', []):
-            # Add minimum engagement filter to query
-            full_query = f"{query} min_faves:{min_likes}"
+        if tweets:
+            self.db.upsert_tweets_batch(tweets)
 
-            try:
-                tweets = self.client.search_all_pages(
-                    query=full_query,
-                    max_total=200,
-                    since_hours=self.config['detection']['baseline_window_hours']
-                )
+        logger.info(f"[{community_name}] Apify: {len(tweets)} tweets from broad search")
+        return tweets
 
-                for tweet in tweets:
-                    tweet['community'] = name
-                    tweet['is_priority_account'] = (
-                        tweet.get('author_username', '').lower() in priority_usernames
-                    )
-
-                all_tweets.extend(tweets)
-                self.db.log_fetch(name, query, len(tweets))
-                logger.info(f"[{name}] Query '{query[:50]}...' → {len(tweets)} tweets")
-
-            except Exception as e:
-                logger.error(f"[{name}] Error fetching query '{query[:50]}...': {e}")
-                continue
-
-        # Store tweets
-        if all_tweets:
-            self.db.upsert_tweets_batch(all_tweets)
-            logger.info(f"[{name}] Total: {len(all_tweets)} tweets stored")
-
-        return all_tweets
-
-    def detect_trends_for_community(self, name: str, community_config: dict) -> list:
-        """Run trend detection for a community."""
+    def detect_trends_for_community(self, name: str, all_tweets: list) -> list:
+        """Run trend detection on fetched tweets."""
         now = time.time()
         trending_hours = self.config['detection']['trending_window_hours']
-        baseline_hours = self.config['detection']['baseline_window_hours']
 
-        current_tweets = self.db.get_tweets_in_window(
-            name,
-            now - (trending_hours * 3600),
-            now
-        )
-        baseline_tweets = self.db.get_tweets_in_window(
-            name,
-            now - (baseline_hours * 3600),
-            now - (trending_hours * 3600)
-        )
+        # Split into current vs baseline based on created_at or fetched_at
+        current_tweets = []
+        baseline_tweets = []
+        cutoff = now - (trending_hours * 3600)
 
-        logger.info(
-            f"[{name}] Detecting trends: {len(current_tweets)} current, "
-            f"{len(baseline_tweets)} baseline tweets"
-        )
+        for t in all_tweets:
+            if t.get('fetched_at', now) >= cutoff:
+                current_tweets.append(t)
+            else:
+                baseline_tweets.append(t)
+
+        # If we can't split well (all tweets are "current"), use engagement as signal
+        if not baseline_tweets and current_tweets:
+            # Use all tweets as current, empty baseline = everything looks trending
+            # Better: split by engagement percentile
+            logger.info(f"[{name}] No baseline window, using all {len(current_tweets)} tweets as current")
+
+        logger.info(f"[{name}] Detecting trends: {len(current_tweets)} current, "
+                    f"{len(baseline_tweets)} baseline")
 
         trends = self.detector.detect_trends(current_tweets, baseline_tweets, name)
 
-        # Store trends
         for trend in trends:
             trend_id = self.db.insert_trend(trend)
             trend['id'] = trend_id
 
         return trends
 
-    def run_scan(self) -> dict:
+    def run_scan(self, use_twitter: bool = True, use_apify: bool = True) -> dict:
         """
-        Run a full scan: fetch tweets for all enabled communities,
-        detect trends, and return results.
+        Run a full scan using configured data sources.
         """
         results = {}
         communities = self.get_enabled_communities()
 
         for name, cfg in communities.items():
-            logger.info(f"Scanning community: {name}")
+            logger.info(f"{'='*40}")
+            logger.info(f"Scanning community: {cfg.get('name', name)}")
 
-            # Fetch fresh data
-            tweets = self.fetch_community(name, cfg)
+            all_tweets = []
 
-            # Detect trends
-            trends = self.detect_trends_for_community(name, cfg)
+            # 1. Twitter API: precise timeline monitoring
+            if use_twitter and self.twitter:
+                timeline_tweets = self.fetch_timelines(name, cfg)
+                all_tweets.extend(timeline_tweets)
+
+            # 2. Apify: broad discovery
+            if use_apify and self.apify:
+                apify_tweets = self.fetch_apify(name, cfg)
+                all_tweets.extend(apify_tweets)
+
+            # 3. Detect trends
+            trends = self.detect_trends_for_community(name, all_tweets)
 
             results[name] = {
                 'community_name': cfg.get('name', name),
-                'tweets_fetched': len(tweets),
+                'tweets_fetched': len(all_tweets),
+                'timeline_tweets': len([t for t in all_tweets if t.get('source') != 'apify']),
+                'apify_tweets': len([t for t in all_tweets if t.get('source') == 'apify']),
                 'trends': trends,
             }
 
-        # Cleanup old data periodically
-        self.db.cleanup_old_data(
-            self.config['storage'].get('retention_days', 30)
-        )
-
+        self.db.cleanup_old_data(self.config['storage'].get('retention_days', 30))
         return results
 
     def format_alert(self, results: dict) -> Optional[str]:
-        """
-        Format scan results into a Telegram alert message.
-        Returns None if nothing worth alerting.
-        """
+        """Format scan results into a Telegram alert message."""
         alert_threshold = self.config['alerts'].get('alert_velocity_threshold', 5.0)
-        include_drafts = self.config['alerts'].get('include_drafts', True)
 
         sections = []
         has_trends = False
 
         for name, data in results.items():
             trends = data.get('trends', [])
+            # For initial runs, show all trends (velocity threshold is less useful
+            # without a proper baseline)
             hot_trends = [t for t in trends if t['velocity_score'] >= alert_threshold]
+
+            # If no hot trends, show top trends anyway if they exist
+            if not hot_trends and trends:
+                hot_trends = trends[:3]
 
             if not hot_trends:
                 continue
 
-            # Filter out already-alerted topics
             new_trends = []
             for t in hot_trends:
                 if not self.db.was_alerted_recently(t['topic'], name, hours=2):
@@ -187,6 +276,8 @@ class TwitterRadar:
             has_trends = True
             community_name = data.get('community_name', name)
             section = [f"\n**{community_name}** ({len(new_trends)} trending)"]
+            section.append(f"_Tweets scanned: {data['tweets_fetched']} "
+                         f"(API: {data['timeline_tweets']}, Apify: {data['apify_tweets']})_")
 
             for i, trend in enumerate(new_trends, 1):
                 section.append(
@@ -195,22 +286,16 @@ class TwitterRadar:
                     f"{trend['tweet_count']} tweets)"
                 )
 
-                # Add top tweets
                 for tweet in trend.get('top_tweets', [])[:3]:
-                    engagement = (
-                        tweet.get('likes', 0) + tweet.get('retweets', 0) * 2
-                    )
+                    url = tweet.get('url', '')
+                    url_text = f" [{url}]" if url else ""
                     section.append(
                         f"  → @{tweet.get('author_username', '?')}: "
                         f"{tweet['text'][:150]}... "
                         f"({tweet.get('likes', 0)}❤️ {tweet.get('retweets', 0)}🔁)"
+                        f"{url_text}"
                     )
 
-                # Include draft generation prompts (to be filled by the caller)
-                if include_drafts:
-                    section.append(f"\n  [Draft prompts available for this trend]")
-
-                # Log the alert
                 self.db.insert_alert({
                     'trend_id': trend.get('id'),
                     'community': name,
@@ -224,17 +309,17 @@ class TwitterRadar:
         if not has_trends:
             return None
 
-        header = "**🔥 TWITTER TREND RADAR**\n"
+        header = "**TWITTER TREND RADAR**\n"
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        header += f"*Scan: {timestamp}*"
+        header += f"_Scan: {timestamp}_"
+
+        if self.twitter:
+            header += f"\n_Twitter API credits remaining: {self.twitter.credits.remaining}_"
 
         return header + "\n" + "\n---\n".join(sections)
 
     def get_draft_prompts(self, trend: dict) -> list[dict]:
-        """
-        Get draft generation prompts for a trend.
-        Returns list of {style, prompt} dicts to be sent to an LLM.
-        """
+        """Get draft generation prompts for a trend."""
         styles = self.config.get('drafts', {}).get('styles', [])
         prompts = []
         for style in styles:
@@ -247,18 +332,13 @@ class TwitterRadar:
         return prompts
 
     def is_quiet_hours(self) -> bool:
-        """Check if we're in quiet hours."""
         quiet = self.config['alerts'].get('quiet_hours', {})
         if not quiet:
             return False
-
-        tz_name = quiet.get('timezone', 'UTC')
-        # Simple hour check — we use the system clock
-        now_hour = datetime.now().hour  # Local time
+        now_hour = datetime.now().hour
         start = quiet.get('start', 23)
         end = quiet.get('end', 8)
-
-        if start > end:  # Wraps midnight
+        if start > end:
             return now_hour >= start or now_hour < end
         else:
             return start <= now_hour < end
