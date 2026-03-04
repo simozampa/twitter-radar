@@ -39,9 +39,9 @@ trending:
 detection:
   baseline_window_hours: 24
   trending_window_hours: 4
-  min_velocity_score: 2.0
-  max_trends_per_community: 5
-  dedup_similarity_threshold: 0.75
+  min_velocity_score: 1.5
+  max_trends_per_community: 10
+  min_cluster_size: 3
 
 # Alerts
 alerts:

@@ -1,6 +1,6 @@
 """
 Twitter API v2 client for Trend Radar.
-Focused on user timelines (not search) to conserve credits.
+Supports home timeline (OAuth 1.0a user-context) + individual user timelines.
 """
 
 import os
@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import requests
+from requests_oauthlib import OAuth1Session
 
 logger = logging.getLogger("twitter_radar.client")
 
@@ -95,7 +96,9 @@ class RateLimiter:
 
 
 class TwitterClient:
-    def __init__(self, bearer_token: str, monthly_credit_limit: int = 15000):
+    def __init__(self, bearer_token: str, monthly_credit_limit: int = 15000,
+                 consumer_key: str = None, consumer_secret: str = None,
+                 access_token: str = None, access_token_secret: str = None):
         self.bearer_token = bearer_token
         self.session = requests.Session()
         self.session.headers.update({
@@ -104,6 +107,15 @@ class TwitterClient:
         })
         self.limiter = RateLimiter()
         self.credits = CreditTracker(monthly_credit_limit)
+
+        # OAuth 1.0a session for user-context endpoints (home timeline)
+        self.oauth_session = None
+        if all([consumer_key, consumer_secret, access_token, access_token_secret]):
+            self.oauth_session = OAuth1Session(
+                consumer_key, consumer_secret,
+                access_token, access_token_secret
+            )
+            logger.info("OAuth 1.0a user-context auth initialized")
 
     def _get(self, endpoint: str, params: dict, endpoint_type: str = "default") -> dict:
         """Make a rate-limited GET request."""
@@ -193,6 +205,116 @@ class TwitterClient:
 
         self.credits.consume(len(tweets))
         return tweets
+
+    def get_home_timeline(self, user_id: str, max_results: int = 100,
+                          pagination_token: str = None) -> tuple[list, Optional[str]]:
+        """
+        Get the authenticated user's home timeline (reverse chronological).
+        This is what Twitter's algo thinks YOU should see.
+        Requires OAuth 1.0a user-context auth.
+
+        Returns: (tweets, next_pagination_token)
+        Cost: $0.005 per tweet read (pay-per-use).
+        """
+        if not self.oauth_session:
+            logger.error("Home timeline requires OAuth 1.0a credentials")
+            return [], None
+
+        if not self.credits.can_afford(max_results):
+            logger.warning(f"Skipping home timeline: insufficient credits "
+                          f"({self.credits.remaining} remaining)")
+            return [], None
+
+        params = {
+            "max_results": min(max_results, 100),
+            "tweet.fields": "created_at,public_metrics,author_id,text,entities,conversation_id",
+            "user.fields": "username,public_metrics",
+            "expansions": "author_id",
+        }
+        if pagination_token:
+            params["pagination_token"] = pagination_token
+
+        url = f"{API_BASE}/users/{user_id}/timelines/reverse_chronological"
+
+        self.limiter.wait_if_needed("timeline")
+        try:
+            resp = self.oauth_session.get(url, params=params, timeout=30)
+        except Exception as e:
+            logger.error(f"Home timeline request failed: {e}")
+            return [], None
+
+        if resp.status_code == 429:
+            reset = int(resp.headers.get("x-rate-limit-reset", time.time() + 900))
+            sleep_time = max(reset - time.time() + 1, 1)
+            logger.warning(f"429 rate limited (home timeline). Sleeping {sleep_time:.0f}s")
+            time.sleep(sleep_time)
+            return self.get_home_timeline(user_id, max_results, pagination_token)
+
+        if resp.status_code != 200:
+            logger.error(f"Home timeline error {resp.status_code}: {resp.text[:500]}")
+            return [], None
+
+        data = resp.json()
+
+        # Build author lookup from expansions
+        authors = {}
+        for u in data.get("includes", {}).get("users", []):
+            authors[u["id"]] = {
+                "username": u["username"],
+                "followers": u.get("public_metrics", {}).get("followers_count", 0),
+            }
+
+        tweets = []
+        for t in data.get("data", []):
+            metrics = t.get("public_metrics", {})
+            author_id = t.get("author_id", "")
+            author_info = authors.get(author_id, {})
+
+            tweets.append({
+                "tweet_id": t["id"],
+                "author_id": author_id,
+                "author_username": author_info.get("username", "unknown"),
+                "author_followers": author_info.get("followers", 0),
+                "text": t["text"],
+                "created_at": t.get("created_at", ""),
+                "likes": metrics.get("like_count", 0),
+                "retweets": metrics.get("retweet_count", 0),
+                "replies": metrics.get("reply_count", 0),
+                "quotes": metrics.get("quote_count", 0),
+                "impressions": metrics.get("impression_count", 0),
+                "source": "home_timeline",
+            })
+
+        self.credits.consume(len(tweets))
+
+        next_token = data.get("meta", {}).get("next_token")
+        logger.info(f"Home timeline: {len(tweets)} tweets, "
+                    f"credits remaining: {self.credits.remaining}")
+
+        return tweets, next_token
+
+    def get_home_timeline_pages(self, user_id: str, total_tweets: int = 200) -> list:
+        """
+        Paginate through home timeline to get desired number of tweets.
+        Default 200 tweets = 2 API calls (100 per page).
+        """
+        all_tweets = []
+        next_token = None
+
+        while len(all_tweets) < total_tweets:
+            remaining = min(100, total_tweets - len(all_tweets))
+            tweets, next_token = self.get_home_timeline(
+                user_id, max_results=remaining, pagination_token=next_token
+            )
+            all_tweets.extend(tweets)
+
+            if not next_token or not tweets:
+                break
+
+            time.sleep(0.5)  # small delay between pages
+
+        logger.info(f"Home timeline total: {len(all_tweets)} tweets across pages")
+        return all_tweets
 
     def get_timelines_batch(self, user_ids: dict, max_per_user: int = 10,
                             since_hours: float = 24) -> list:
