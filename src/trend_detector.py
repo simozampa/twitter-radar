@@ -217,14 +217,12 @@ def compute_velocity(current_score: float, baseline_score: float,
     current_rate = current_score / current_hours
 
     if baseline_hours <= 0 or baseline_score <= 0:
-        # No baseline — assign moderate velocity based on raw engagement
-        # This prevents "everything is infinity" on first scan
-        if current_rate > 100:
-            return min(current_rate / 10, 50.0)  # cap at 50x
-        elif current_rate > 10:
-            return min(current_rate / 5, 20.0)
-        else:
-            return min(current_rate, 10.0)
+        # No baseline — use logarithmic dampening so first scans don't explode.
+        # A topic needs genuinely massive engagement to even reach 10x.
+        if current_rate <= 0:
+            return 0.0
+        # log10 scale: rate 10 → ~2x, rate 100 → ~3x, rate 10000 → ~5x
+        return round(min(1.0 + math.log10(max(current_rate, 1)), 10.0), 2)
 
     baseline_rate = baseline_score / baseline_hours
     if baseline_rate <= 0:
@@ -366,9 +364,15 @@ class TrendDetector:
         Cluster related topics into coherent trends.
         Uses tweet overlap — if topics share many of the same tweets,
         they're part of the same trend.
+
+        Key: compare against the SEED topic's tweets only (not the growing
+        cluster), and cap cluster size to prevent God Clusters.
         """
         if not scored_topics:
             return []
+
+        MAX_CLUSTER_SIZE = 8  # max topics per cluster
+        OVERLAP_THRESHOLD = 0.50  # 50% overlap required (was 25%)
 
         used = set()
         trends = []
@@ -378,25 +382,28 @@ class TrendDetector:
             if topic in used:
                 continue
 
-            # Start a new cluster
+            # Start a new cluster — seed_tweet_ids stays fixed
             cluster_topics = [topic]
-            cluster_tweet_ids = set(t['tweet_id'] for t in item['tweets'])
+            seed_tweet_ids = set(t['tweet_id'] for t in item['tweets'])
+            cluster_tweet_ids = set(seed_tweet_ids)
             cluster_engagement = item['engagement']
             cluster_velocity = item['velocity']
             cluster_type = item['type']
 
-            # Find related topics (high tweet overlap)
+            # Find related topics (high tweet overlap with SEED, not growing cluster)
             for other in scored_topics:
+                if len(cluster_topics) >= MAX_CLUSTER_SIZE:
+                    break
                 other_topic = other['topic']
                 if other_topic == topic or other_topic in used:
                     continue
 
                 other_tweet_ids = set(t['tweet_id'] for t in other['tweets'])
-                overlap = len(cluster_tweet_ids & other_tweet_ids)
-                min_size = min(len(cluster_tweet_ids), len(other_tweet_ids))
+                # Compare against seed, not the ever-growing cluster
+                overlap = len(seed_tweet_ids & other_tweet_ids)
+                min_size = min(len(seed_tweet_ids), len(other_tweet_ids))
 
-                # Require >25% overlap to merge (looser = bigger clusters)
-                if min_size > 0 and overlap / min_size > 0.25:
+                if min_size > 0 and overlap / min_size > OVERLAP_THRESHOLD:
                     cluster_topics.append(other_topic)
                     cluster_tweet_ids |= other_tweet_ids
                     cluster_engagement += other['engagement']
