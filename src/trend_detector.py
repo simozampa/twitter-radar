@@ -1,7 +1,11 @@
 """
-Trend detection engine.
-Identifies trending topics by analyzing engagement velocity,
-keyword clustering, and conversation patterns.
+Trend detection engine v2.
+Identifies trending topics using:
+  - Entity/phrase extraction (not single words)
+  - Engagement normalization (relative to author's reach)
+  - RT deduplication (credit original, not retweeter)
+  - Tighter clustering (co-occurrence threshold)
+  - Velocity = acceleration over baseline
 """
 
 import re
@@ -13,13 +17,17 @@ from typing import Optional
 
 logger = logging.getLogger("twitter_radar.detector")
 
-# Common stop words to filter out
+# ──────────────────────────────────────────────────────────────
+# STOP WORDS (expanded for twitter)
+# ──────────────────────────────────────────────────────────────
+
 STOP_WORDS = {
+    # English common
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "dare", "ought",
-    "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-    "as", "into", "through", "during", "before", "after", "above", "below",
+    "should", "may", "might", "shall", "can", "need", "ought", "used",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+    "into", "through", "during", "before", "after", "above", "below",
     "between", "out", "off", "over", "under", "again", "further", "then",
     "once", "here", "there", "when", "where", "why", "how", "all", "both",
     "each", "few", "more", "most", "other", "some", "such", "no", "nor",
@@ -31,212 +39,425 @@ STOP_WORDS = {
     "also", "new", "even", "still", "back", "going", "much", "way",
     "really", "think", "know", "see", "come", "make", "right", "say",
     "said", "well", "good", "great", "time", "people", "want", "look",
+    # Twitter-specific noise
     "https", "http", "amp", "rt", "via", "lol", "lmao", "gonna", "gotta",
     "thing", "things", "yeah", "yes", "hey", "let", "take", "every",
+    "literally", "actually", "basically", "probably", "definitely",
+    "already", "always", "never", "ever", "many", "much", "any",
+    "something", "anything", "everything", "nothing", "someone",
+    "anyone", "everyone", "lot", "lots", "bit", "long", "big",
+    "first", "last", "next", "best", "real", "sure", "hard",
+    "put", "keep", "try", "start", "give", "tell", "call",
+    "run", "find", "use", "work", "show", "play", "move",
+    "live", "feel", "high", "point", "end", "turn", "left",
+    "help", "line", "day", "man", "men", "old", "year", "years",
+    "today", "week", "month", "world", "life", "part", "while",
+    "since", "though", "enough", "goes", "done", "seen",
+    "won", "gets", "got", "set", "went", "came", "made",
+    "being", "having", "doing", "getting", "making", "going",
+    "looking", "coming", "taking", "saying", "thinking",
+    "true", "false", "full", "free", "based", "post",
+    "read", "watch", "check", "follow", "share", "drop",
+    "claim", "believe", "mean", "stop",
 }
 
 
-def extract_keywords(text: str) -> list[str]:
-    """Extract meaningful keywords from tweet text."""
-    # Remove URLs
-    text = re.sub(r'https?://\S+', '', text)
-    # Remove mentions
-    text = re.sub(r'@\w+', '', text)
-    # Extract hashtags separately
-    hashtags = re.findall(r'#(\w+)', text.lower())
-    # Extract cashtags
-    cashtags = re.findall(r'\$([A-Za-z]+)', text)
-    # Clean and tokenize
-    text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower())
-    words = text.split()
-    # Filter
-    keywords = [w for w in words if len(w) > 2 and w not in STOP_WORDS]
-    # Combine, prioritize hashtags and cashtags
-    return cashtags + hashtags + keywords
+# ──────────────────────────────────────────────────────────────
+# ENTITY / PHRASE EXTRACTION
+# ──────────────────────────────────────────────────────────────
 
+def extract_entities(text: str) -> dict:
+    """
+    Extract meaningful entities from a tweet.
+    Returns dict with categorized entities.
+    """
+    entities = {
+        'cashtags': [],     # $BTC, $ETH
+        'hashtags': [],     # #AI, #crypto
+        'mentions': [],     # @OpenAI
+        'phrases': [],      # multi-word phrases
+        'keywords': [],     # significant single words
+    }
+
+    # Remove URLs
+    clean = re.sub(r'https?://\S+', '', text)
+
+    # Extract cashtags (high signal)
+    entities['cashtags'] = [m.upper() for m in re.findall(r'\$([A-Za-z]{2,6})', clean)]
+
+    # Extract hashtags
+    entities['hashtags'] = [m.lower() for m in re.findall(r'#(\w{2,30})', clean)]
+
+    # Extract mentions
+    entities['mentions'] = [m.lower() for m in re.findall(r'@(\w{1,30})', clean)]
+
+    # Clean text for phrase extraction
+    clean = re.sub(r'[#$@]\w+', '', clean)  # remove tags
+    clean = re.sub(r'[^a-zA-Z0-9\s\'-]', ' ', clean)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    words = clean.lower().split()
+
+    # Extract bigrams (two-word phrases)
+    for i in range(len(words) - 1):
+        w1, w2 = words[i], words[i + 1]
+        if w1 not in STOP_WORDS and w2 not in STOP_WORDS and len(w1) > 2 and len(w2) > 2:
+            entities['phrases'].append(f"{w1} {w2}")
+
+    # Extract significant single words (proper nouns, longer words)
+    for w in words:
+        if len(w) > 3 and w not in STOP_WORDS:
+            entities['keywords'].append(w)
+
+    return entities
+
+
+def get_all_topics(entities: dict) -> list[str]:
+    """Get a flat list of all topics from entities, prioritized."""
+    topics = []
+    # Priority order: cashtags > hashtags > phrases > keywords
+    topics.extend([f"${t}" for t in entities['cashtags']])
+    topics.extend([f"#{t}" for t in entities['hashtags']])
+    topics.extend(entities['phrases'])
+    topics.extend(entities['keywords'])
+    return topics
+
+
+# ──────────────────────────────────────────────────────────────
+# RT HANDLING
+# ──────────────────────────────────────────────────────────────
+
+def parse_rt(tweet: dict) -> dict:
+    """
+    If tweet is a RT, extract the original author and text.
+    Returns modified tweet dict with rt_author and cleaned text.
+    """
+    text = tweet.get('text', '')
+    tweet = dict(tweet)  # don't mutate original
+
+    if text.startswith('RT @'):
+        match = re.match(r'^RT @(\w+):\s*(.*)', text, re.DOTALL)
+        if match:
+            tweet['rt_author'] = match.group(1).lower()
+            tweet['original_text'] = match.group(2)
+            tweet['is_rt'] = True
+            return tweet
+
+    tweet['is_rt'] = False
+    tweet['original_text'] = text
+    return tweet
+
+
+def dedup_rts(tweets: list) -> list:
+    """
+    Deduplicate RTs — keep the version with highest engagement.
+    Group by original text similarity.
+    """
+    # Group by first 100 chars of original text
+    groups = defaultdict(list)
+    for t in tweets:
+        t = parse_rt(t)
+        key = t.get('original_text', t.get('text', ''))[:100].lower().strip()
+        groups[key].append(t)
+
+    deduped = []
+    for key, group in groups.items():
+        # Keep the one with highest engagement
+        best = max(group, key=lambda t: compute_engagement_score(t))
+        # But aggregate RT count from all versions
+        total_rts = sum(t.get('retweets', 0) for t in group)
+        best['retweets'] = max(best.get('retweets', 0), total_rts)
+        best['rt_count'] = len(group)  # how many people RTed this
+        deduped.append(best)
+
+    return deduped
+
+
+# ──────────────────────────────────────────────────────────────
+# ENGAGEMENT SCORING
+# ──────────────────────────────────────────────────────────────
 
 def compute_engagement_score(tweet: dict) -> float:
     """
     Weighted engagement score.
-    Quotes and retweets are higher signal than likes.
-    Priority accounts get a 2x boost.
+    Normalized by author's reach (follower count).
+    A 100-like tweet from a 1k-follower account is hotter
+    than a 100-like tweet from a 10M-follower account.
     """
-    score = (
+    # RT count (how many people in your feed RTed this) is strong signal
+    rt_boost = tweet.get('rt_count', 1)
+
+    raw = (
         tweet.get('likes', 0) * 1.0 +
-        tweet.get('retweets', 0) * 3.0 +
-        tweet.get('replies', 0) * 2.0 +
-        tweet.get('quotes', 0) * 4.0
-    )
-    if tweet.get('is_priority_account'):
-        score *= 2.0
-    return score
+        tweet.get('retweets', 0) * 2.0 +
+        tweet.get('replies', 0) * 1.5 +
+        tweet.get('quotes', 0) * 3.0
+    ) * math.sqrt(rt_boost)  # boost by how viral it went in your feed
+
+    # Normalize by follower count (engagement rate)
+    followers = tweet.get('author_followers', 0)
+    if followers > 0:
+        # Engagement rate with diminishing returns for huge accounts
+        rate = raw / math.sqrt(followers)
+        # Boost: small accounts with high engagement = strong signal
+        return rate * math.log2(max(raw, 2))
+    else:
+        return raw
 
 
-def compute_velocity(current_engagement: float, baseline_engagement: float,
+def compute_velocity(current_score: float, baseline_score: float,
                      current_hours: float, baseline_hours: float) -> float:
     """
-    Compute engagement velocity — how fast engagement is accelerating
-    relative to the baseline period.
-    
-    Returns a multiplier: 1.0 = normal, 5.0 = 5x above baseline rate.
+    Engagement velocity — how fast a topic is accelerating.
+    Returns multiplier: 1.0 = normal, 5.0 = 5x above baseline.
+    Handles edge cases (no baseline = moderate velocity, not infinite).
     """
-    if baseline_hours <= 0 or current_hours <= 0:
+    if current_hours <= 0:
         return 0.0
 
-    baseline_rate = baseline_engagement / baseline_hours if baseline_engagement > 0 else 1.0
-    current_rate = current_engagement / current_hours
+    current_rate = current_score / current_hours
 
-    velocity = current_rate / baseline_rate if baseline_rate > 0 else current_rate
-    return round(velocity, 2)
+    if baseline_hours <= 0 or baseline_score <= 0:
+        # No baseline — assign moderate velocity based on raw engagement
+        # This prevents "everything is infinity" on first scan
+        if current_rate > 100:
+            return min(current_rate / 10, 50.0)  # cap at 50x
+        elif current_rate > 10:
+            return min(current_rate / 5, 20.0)
+        else:
+            return min(current_rate, 10.0)
 
+    baseline_rate = baseline_score / baseline_hours
+    if baseline_rate <= 0:
+        return min(current_rate, 50.0)
+
+    velocity = current_rate / baseline_rate
+    return round(min(velocity, 100.0), 2)  # cap at 100x
+
+
+# ──────────────────────────────────────────────────────────────
+# TREND DETECTOR
+# ──────────────────────────────────────────────────────────────
 
 class TrendDetector:
     def __init__(self, config: dict):
         self.baseline_hours = config.get('baseline_window_hours', 24)
-        self.trending_hours = config.get('trending_window_hours', 2)
-        self.min_velocity = config.get('min_velocity_score', 3.0)
+        self.trending_hours = config.get('trending_window_hours', 4)
+        self.min_velocity = config.get('min_velocity_score', 2.0)
         self.max_trends = config.get('max_trends_per_community', 5)
         self.dedup_threshold = config.get('dedup_similarity_threshold', 0.75)
 
     def detect_trends(self, current_tweets: list, baseline_tweets: list,
                       community: str) -> list[dict]:
         """
-        Detect trending topics by comparing current vs baseline engagement.
-        
-        Returns list of trend dicts sorted by velocity_score.
+        Detect trending topics.
+        1. Dedup RTs
+        2. Extract entities/phrases
+        3. Count topic frequency + engagement
+        4. Compute velocity vs baseline
+        5. Cluster related topics
+        6. Return sorted trends
         """
-        # Extract and count keywords in both windows
-        current_keywords = Counter()
-        baseline_keywords = Counter()
-        current_engagement_by_keyword = defaultdict(float)
-        baseline_engagement_by_keyword = defaultdict(float)
-        keyword_tweets = defaultdict(list)  # keyword -> list of tweets
+        # Step 1: Dedup RTs
+        current_tweets = dedup_rts(current_tweets)
+        if baseline_tweets:
+            baseline_tweets = dedup_rts(baseline_tweets)
+
+        # Step 2: Extract topics and score
+        topic_data = defaultdict(lambda: {
+            'count': 0,
+            'engagement': 0.0,
+            'tweets': [],
+            'type': 'keyword',  # cashtag, hashtag, phrase, keyword
+        })
 
         for tweet in current_tweets:
-            keywords = extract_keywords(tweet['text'])
+            entities = extract_entities(tweet.get('original_text', tweet.get('text', '')))
             engagement = compute_engagement_score(tweet)
-            seen = set()
-            for kw in keywords:
-                if kw not in seen:
-                    current_keywords[kw] += 1
-                    current_engagement_by_keyword[kw] += engagement
-                    keyword_tweets[kw].append(tweet)
-                    seen.add(kw)
+            seen_topics = set()
 
-        for tweet in baseline_tweets:
-            keywords = extract_keywords(tweet['text'])
+            # Process each entity type with priority weighting
+            for cashtag in entities['cashtags']:
+                topic = f"${cashtag}"
+                if topic not in seen_topics:
+                    topic_data[topic]['count'] += 1
+                    topic_data[topic]['engagement'] += engagement * 2.0  # boost cashtags
+                    topic_data[topic]['tweets'].append(tweet)
+                    topic_data[topic]['type'] = 'cashtag'
+                    seen_topics.add(topic)
+
+            for hashtag in entities['hashtags']:
+                topic = f"#{hashtag}"
+                if topic not in seen_topics:
+                    topic_data[topic]['count'] += 1
+                    topic_data[topic]['engagement'] += engagement * 1.5
+                    topic_data[topic]['tweets'].append(tweet)
+                    topic_data[topic]['type'] = 'hashtag'
+                    seen_topics.add(topic)
+
+            for phrase in entities['phrases']:
+                if phrase not in seen_topics:
+                    topic_data[phrase]['count'] += 1
+                    topic_data[phrase]['engagement'] += engagement * 1.5  # phrases > single words
+                    topic_data[phrase]['tweets'].append(tweet)
+                    topic_data[phrase]['type'] = 'phrase'
+                    seen_topics.add(phrase)
+
+            for keyword in entities['keywords']:
+                if keyword not in seen_topics:
+                    topic_data[keyword]['count'] += 1
+                    topic_data[keyword]['engagement'] += engagement
+                    topic_data[keyword]['tweets'].append(tweet)
+                    topic_data[keyword]['type'] = 'keyword'
+                    seen_topics.add(keyword)
+
+        # Step 3: Baseline engagement per topic
+        baseline_engagement = defaultdict(float)
+        for tweet in (baseline_tweets or []):
+            entities = extract_entities(tweet.get('original_text', tweet.get('text', '')))
             engagement = compute_engagement_score(tweet)
-            seen = set()
-            for kw in keywords:
-                if kw not in seen:
-                    baseline_keywords[kw] += 1
-                    baseline_engagement_by_keyword[kw] += engagement
-                    seen.add(kw)
+            for topic in get_all_topics(entities):
+                baseline_engagement[topic] += engagement
 
-        # Score each keyword by velocity
-        keyword_scores = []
-        for kw, count in current_keywords.items():
-            if count < 3:  # Need at least 3 tweets mentioning it
+        # Step 4: Score and filter topics
+        scored_topics = []
+        for topic, data in topic_data.items():
+            # Higher threshold for single keywords (noisy), lower for entities/phrases
+            min_count = 2
+            if data['type'] == 'keyword':
+                min_count = 3  # single words need more evidence
+            if data['count'] < min_count:
                 continue
 
             velocity = compute_velocity(
-                current_engagement_by_keyword[kw],
-                baseline_engagement_by_keyword.get(kw, 0),
+                data['engagement'],
+                baseline_engagement.get(topic, 0),
                 self.trending_hours,
                 self.baseline_hours
             )
 
-            if velocity >= self.min_velocity:
-                # Get top tweets for this keyword
-                kw_tweets = sorted(
-                    keyword_tweets[kw],
-                    key=lambda t: compute_engagement_score(t),
-                    reverse=True
-                )[:10]
+            if velocity < self.min_velocity:
+                continue
 
-                keyword_scores.append({
-                    'keyword': kw,
-                    'velocity': velocity,
-                    'tweet_count': count,
-                    'total_engagement': current_engagement_by_keyword[kw],
-                    'tweets': kw_tweets,
-                })
+            # Sort tweets by engagement
+            data['tweets'].sort(key=lambda t: compute_engagement_score(t), reverse=True)
 
-        keyword_scores.sort(key=lambda x: x['velocity'], reverse=True)
+            scored_topics.append({
+                'topic': topic,
+                'type': data['type'],
+                'velocity': velocity,
+                'count': data['count'],
+                'engagement': data['engagement'],
+                'tweets': data['tweets'][:10],
+            })
 
-        # Cluster similar keywords into topics
-        trends = self._cluster_keywords(keyword_scores, community)
+        # Sort by velocity * engagement (both matter)
+        scored_topics.sort(
+            key=lambda x: x['velocity'] * math.log2(max(x['engagement'], 2)),
+            reverse=True
+        )
+
+        # Step 5: Cluster related topics
+        trends = self._cluster_topics(scored_topics, community)
 
         return trends[:self.max_trends]
 
-    def _cluster_keywords(self, keyword_scores: list, community: str) -> list[dict]:
+    def _cluster_topics(self, scored_topics: list, community: str) -> list[dict]:
         """
-        Cluster related keywords into coherent topics.
-        Simple approach: merge keywords that frequently co-occur in the same tweets.
+        Cluster related topics into coherent trends.
+        Uses tweet overlap — if topics share many of the same tweets,
+        they're part of the same trend.
         """
-        if not keyword_scores:
+        if not scored_topics:
             return []
 
         used = set()
         trends = []
 
-        for item in keyword_scores:
-            kw = item['keyword']
-            if kw in used:
+        for item in scored_topics:
+            topic = item['topic']
+            if topic in used:
                 continue
 
-            # Find related keywords (co-occurring in same tweets)
-            cluster_keywords = [kw]
-            cluster_tweets = set(t['tweet_id'] for t in item['tweets'])
+            # Start a new cluster
+            cluster_topics = [topic]
+            cluster_tweet_ids = set(t['tweet_id'] for t in item['tweets'])
+            cluster_engagement = item['engagement']
             cluster_velocity = item['velocity']
-            cluster_engagement = item['total_engagement']
+            cluster_type = item['type']
 
-            for other in keyword_scores:
-                other_kw = other['keyword']
-                if other_kw == kw or other_kw in used:
+            # Find related topics (high tweet overlap)
+            for other in scored_topics:
+                other_topic = other['topic']
+                if other_topic == topic or other_topic in used:
                     continue
-                # Check co-occurrence
-                other_tweets = set(t['tweet_id'] for t in other['tweets'])
-                overlap = len(cluster_tweets & other_tweets)
-                if overlap >= 2 or (overlap >= 1 and len(other_tweets) <= 5):
-                    cluster_keywords.append(other_kw)
-                    cluster_tweets |= other_tweets
+
+                other_tweet_ids = set(t['tweet_id'] for t in other['tweets'])
+                overlap = len(cluster_tweet_ids & other_tweet_ids)
+                min_size = min(len(cluster_tweet_ids), len(other_tweet_ids))
+
+                # Require >25% overlap to merge (looser = bigger clusters)
+                if min_size > 0 and overlap / min_size > 0.25:
+                    cluster_topics.append(other_topic)
+                    cluster_tweet_ids |= other_tweet_ids
+                    cluster_engagement += other['engagement']
                     cluster_velocity = max(cluster_velocity, other['velocity'])
-                    cluster_engagement += other['total_engagement']
-                    used.add(other_kw)
+                    used.add(other_topic)
 
-            used.add(kw)
+            used.add(topic)
 
-            # Build the topic name from top keywords
-            topic = " + ".join(cluster_keywords[:3])
-            if len(cluster_keywords) > 3:
-                topic += f" (+{len(cluster_keywords) - 3} more)"
+            # Build trend name — prioritize by type and engagement
+            # Score each topic by: type priority + engagement contribution
+            type_priority = {'cashtag': 4, 'hashtag': 3, 'phrase': 2, 'keyword': 1}
+            topic_scores = []
+            for t in cluster_topics:
+                # Find this topic's data
+                for st in scored_topics:
+                    if st['topic'] == t:
+                        score = (
+                            type_priority.get(st['type'], 0) * 100 +
+                            st['engagement']
+                        )
+                        topic_scores.append((t, score, st['type']))
+                        break
+                else:
+                    topic_scores.append((t, 0, 'keyword'))
 
-            # Get top tweet IDs
+            topic_scores.sort(key=lambda x: x[1], reverse=True)
+            name_parts = []
+            for t, _, ttype in topic_scores[:3]:
+                if t.startswith('$') or t.startswith('#'):
+                    name_parts.append(t)
+                elif ' ' in t:
+                    name_parts.append(t.title())
+                else:
+                    name_parts.append(t.title())
+
+            trend_name = " / ".join(name_parts)
+            if len(cluster_topics) > 3:
+                trend_name += f" (+{len(cluster_topics) - 3})"
+
+            # Collect all unique tweets, sorted by engagement
             all_tweets = []
-            for ki in keyword_scores:
-                if ki['keyword'] in cluster_keywords:
-                    all_tweets.extend(ki['tweets'])
-
-            # Deduplicate and sort
             seen_ids = set()
-            unique_tweets = []
-            for t in all_tweets:
-                if t['tweet_id'] not in seen_ids:
-                    seen_ids.add(t['tweet_id'])
-                    unique_tweets.append(t)
-            unique_tweets.sort(key=lambda t: compute_engagement_score(t), reverse=True)
+            for st in scored_topics:
+                if st['topic'] in cluster_topics or st['topic'] == topic:
+                    for t in st['tweets']:
+                        if t['tweet_id'] not in seen_ids:
+                            seen_ids.add(t['tweet_id'])
+                            all_tweets.append(t)
+            all_tweets.sort(key=lambda t: compute_engagement_score(t), reverse=True)
 
             trends.append({
                 'community': community,
-                'topic': topic,
-                'keywords': cluster_keywords,
+                'topic': trend_name,
+                'keywords': cluster_topics,
                 'velocity_score': cluster_velocity,
-                'tweet_count': len(unique_tweets),
+                'tweet_count': len(all_tweets),
                 'total_engagement': cluster_engagement,
-                'top_tweet_ids': [t['tweet_id'] for t in unique_tweets[:5]],
-                'top_tweets': unique_tweets[:5],
+                'top_tweet_ids': [t['tweet_id'] for t in all_tweets[:5]],
+                'top_tweets': all_tweets[:5],
             })
 
-        trends.sort(key=lambda t: t['velocity_score'], reverse=True)
+        trends.sort(key=lambda t: t['velocity_score'] * math.log2(max(t['total_engagement'], 2)),
+                     reverse=True)
         return trends
