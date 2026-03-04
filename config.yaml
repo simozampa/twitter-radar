@@ -41,10 +41,8 @@ communities:
       - "elonmusk"
       - "DrJimFan"       # Jim Fan
       - "swyx"           # Swyx
-      - "kaborgo"        # Karpathy
+      - "karpathy"       # Andrej Karpathy
       - "OpenAI"
-      - "xaborgo"        # xAI
-      - "emaborgo"       # Emad
     min_likes: 10
     min_retweets: 3
 

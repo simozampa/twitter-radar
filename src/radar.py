@@ -38,7 +38,6 @@ class TwitterRadar:
             self.twitter = TwitterClient(
                 bearer_token=token,
                 monthly_credit_limit=self.config['twitter'].get('monthly_credit_limit', 15000),
-                rate_limit=self.config['twitter'].get('search_rate_limit', 280)
             )
 
         # --- Apify client (for broad discovery) ---
@@ -56,8 +55,14 @@ class TwitterRadar:
         # --- Trend detector ---
         self.detector = TrendDetector(self.config['detection'])
 
-        # --- Resolved user IDs cache ---
-        self._user_id_cache: dict = {}
+        # --- Resolved user IDs cache (file-backed) ---
+        self._data_dir = Path(db_path).parent
+        self._user_cache_path = self._data_dir / "user_id_cache.json"
+        self._user_id_cache: dict = self._load_user_cache()
+
+        # --- Rotation state: track which accounts were fetched last ---
+        self._rotation_path = self._data_dir / "rotation_state.json"
+        self._rotation = self._load_rotation()
 
     @staticmethod
     def _resolve_env(value: str) -> str:
@@ -65,6 +70,53 @@ class TwitterRadar:
         if value and value.startswith("${") and value.endswith("}"):
             return os.environ.get(value[2:-1], "")
         return value
+
+    def _load_user_cache(self) -> dict:
+        """Load user ID cache from disk."""
+        if self._user_cache_path.exists():
+            try:
+                with open(self._user_cache_path) as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def _save_user_cache(self):
+        """Persist user ID cache to disk."""
+        self._user_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._user_cache_path, 'w') as f:
+            json.dump(self._user_id_cache, f, indent=2)
+
+    def _load_rotation(self) -> dict:
+        if self._rotation_path.exists():
+            try:
+                with open(self._rotation_path) as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def _save_rotation(self):
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._rotation_path, 'w') as f:
+            json.dump(self._rotation, f, indent=2)
+
+    def _get_rotated_accounts(self, community: str, accounts: list[str],
+                               max_slots: int) -> list[str]:
+        """
+        Rotate through accounts so each scan covers different ones.
+        With 9 timeline slots and ~18 accounts across 2 communities,
+        we cycle through all accounts over 2 scans.
+        """
+        last_index = self._rotation.get(community, 0)
+        # Rotate: start from where we left off
+        rotated = accounts[last_index:] + accounts[:last_index]
+        selected = rotated[:max_slots]
+        # Update rotation index
+        new_index = (last_index + max_slots) % len(accounts) if accounts else 0
+        self._rotation[community] = new_index
+        self._save_rotation()
+        return selected
 
     def get_enabled_communities(self) -> dict:
         return {
@@ -81,30 +133,37 @@ class TwitterRadar:
         if not self.twitter:
             return {}
 
-        # Filter out already-cached
-        to_resolve = [u for u in usernames if u.lower() not in self._user_id_cache]
+        # Filter out already-cached (including failed lookups marked as "_NOT_FOUND")
+        to_resolve = [
+            u for u in usernames 
+            if u.lower() not in self._user_id_cache
+        ]
 
         if to_resolve:
             resolved = self.twitter.lookup_users_by_username(to_resolve)
             for username_lower, user_data in resolved.items():
                 self._user_id_cache[username_lower] = user_data['id']
                 logger.info(f"Resolved @{username_lower} → {user_data['id']}")
+            # Mark unresolved as failed so we don't retry
+            for u in to_resolve:
+                if u.lower() not in resolved and u.lower() not in self._user_id_cache:
+                    self._user_id_cache[u.lower()] = "_NOT_FOUND"
+                    logger.warning(f"Marking @{u} as not found (won't retry)")
+            self._save_user_cache()
 
-        # Build {id: username} mapping
+        # Build {id: username} mapping, skip failed lookups
         result = {}
         for u in usernames:
             uid = self._user_id_cache.get(u.lower())
-            if uid:
+            if uid and uid != "_NOT_FOUND":
                 result[uid] = u
-            else:
-                logger.warning(f"Could not resolve @{u}")
 
         return result
 
     def fetch_timelines(self, community_name: str, community_config: dict) -> list:
         """
         Fetch tweets from priority accounts via Twitter API timelines.
-        Very credit-efficient: only reads from accounts we care about.
+        Rotates through accounts each scan (9 slots / 15 min limit).
         """
         if not self.twitter:
             logger.warning("Twitter API not configured, skipping timelines")
@@ -114,8 +173,19 @@ class TwitterRadar:
         if not accounts:
             return []
 
+        # How many timeline slots do we have?
+        available_slots = self.twitter.limiter.timeline_slots_remaining
+        communities = self.get_enabled_communities()
+        num_communities = len(communities)
+        slots_per_community = max(1, available_slots // num_communities)
+
+        # Rotate to select which accounts to fetch this scan
+        selected = self._get_rotated_accounts(community_name, accounts, slots_per_community)
+        logger.info(f"[{community_name}] Selected {len(selected)}/{len(accounts)} accounts "
+                    f"this rotation: {', '.join(selected)}")
+
         # Resolve usernames to IDs
-        user_ids = self._resolve_user_ids(accounts)
+        user_ids = self._resolve_user_ids(selected)
         if not user_ids:
             return []
 

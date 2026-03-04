@@ -48,48 +48,79 @@ class CreditTracker:
 
 
 class RateLimiter:
-    """Simple sliding-window rate limiter."""
+    """
+    Rate limiter with per-endpoint tracking.
+    User timeline endpoint on Basic tier: 10 requests / 15 min.
+    User lookup: 300 requests / 15 min.
+    """
 
-    def __init__(self, max_requests: int, window_seconds: int = 900):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests: list[float] = []
+    def __init__(self):
+        self.endpoints: dict[str, dict] = {
+            "timeline": {"max": 9, "window": 900, "requests": []},   # 10 limit, stay at 9
+            "lookup": {"max": 290, "window": 900, "requests": []},   # 300 limit
+            "default": {"max": 280, "window": 900, "requests": []},
+        }
+        # Track the reset timestamp from API headers
+        self._reset_at: float = 0
 
-    def wait_if_needed(self):
+    def update_from_headers(self, remaining: int, reset_at: int):
+        """Update limiter state from API response headers."""
+        self._reset_at = reset_at
+        if remaining <= 0:
+            logger.info(f"API reports 0 remaining, reset at {reset_at}")
+
+    def wait_if_needed(self, endpoint_type: str = "default"):
+        ep = self.endpoints.get(endpoint_type, self.endpoints["default"])
         now = time.time()
-        self.requests = [t for t in self.requests if now - t < self.window_seconds]
-        if len(self.requests) >= self.max_requests:
-            sleep_time = self.requests[0] + self.window_seconds - now + 1
+        ep["requests"] = [t for t in ep["requests"] if now - t < ep["window"]]
+        if len(ep["requests"]) >= ep["max"]:
+            sleep_time = ep["requests"][0] + ep["window"] - now + 1
             if sleep_time > 0:
-                logger.info(f"Rate limit: sleeping {sleep_time:.1f}s")
+                logger.info(f"Rate limit ({endpoint_type}): sleeping {sleep_time:.1f}s")
                 time.sleep(sleep_time)
-        self.requests.append(time.time())
+        ep["requests"].append(time.time())
+
+    def can_call(self, endpoint_type: str = "default") -> bool:
+        ep = self.endpoints.get(endpoint_type, self.endpoints["default"])
+        now = time.time()
+        active = [t for t in ep["requests"] if now - t < ep["window"]]
+        return len(active) < ep["max"]
+
+    @property
+    def timeline_slots_remaining(self) -> int:
+        ep = self.endpoints["timeline"]
+        now = time.time()
+        active = [t for t in ep["requests"] if now - t < ep["window"]]
+        return max(0, ep["max"] - len(active))
 
 
 class TwitterClient:
-    def __init__(self, bearer_token: str, monthly_credit_limit: int = 15000,
-                 rate_limit: int = 280):
+    def __init__(self, bearer_token: str, monthly_credit_limit: int = 15000):
         self.bearer_token = bearer_token
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {bearer_token}",
             "User-Agent": "TwitterRadar/1.0"
         })
-        self.limiter = RateLimiter(rate_limit, 900)
+        self.limiter = RateLimiter()
         self.credits = CreditTracker(monthly_credit_limit)
 
-    def _get(self, endpoint: str, params: dict) -> dict:
+    def _get(self, endpoint: str, params: dict, endpoint_type: str = "default") -> dict:
         """Make a rate-limited GET request."""
-        self.limiter.wait_if_needed()
+        self.limiter.wait_if_needed(endpoint_type)
         url = f"{API_BASE}/{endpoint}"
         resp = self.session.get(url, params=params, timeout=30)
 
+        # Update rate limiter from response headers
+        remaining = int(resp.headers.get("x-rate-limit-remaining", 999))
+        reset = int(resp.headers.get("x-rate-limit-reset", time.time() + 900))
+        self.limiter.update_from_headers(remaining, reset)
+
         if resp.status_code == 429:
-            reset = int(resp.headers.get("x-rate-limit-reset", time.time() + 60))
             sleep_time = max(reset - time.time() + 1, 1)
-            logger.warning(f"429 rate limited. Sleeping {sleep_time:.0f}s")
+            logger.warning(f"429 rate limited ({endpoint_type}). Sleeping {sleep_time:.0f}s")
             time.sleep(sleep_time)
-            return self._get(endpoint, params)
+            return self._get(endpoint, params, endpoint_type)
 
         if resp.status_code != 200:
             logger.error(f"API error {resp.status_code}: {resp.text[:500]}")
@@ -110,7 +141,7 @@ class TwitterClient:
                 "usernames": ",".join(batch),
                 "user.fields": "id,username,public_metrics,verified,description"
             }
-            data = self._get("users/by", params)
+            data = self._get("users/by", params, endpoint_type="lookup")
             for u in data.get("data", []):
                 results[u["username"].lower()] = u
             errors = data.get("errors", [])
@@ -140,7 +171,7 @@ class TwitterClient:
         }
 
         try:
-            data = self._get(f"users/{user_id}/tweets", params)
+            data = self._get(f"users/{user_id}/tweets", params, endpoint_type="timeline")
         except requests.HTTPError as e:
             logger.error(f"Timeline fetch failed for {user_id}: {e}")
             return []
@@ -166,17 +197,25 @@ class TwitterClient:
     def get_timelines_batch(self, user_ids: dict, max_per_user: int = 10,
                             since_hours: float = 24) -> list:
         """
-        Fetch timelines for multiple users efficiently.
+        Fetch timelines for multiple users.
+        IMPORTANT: Basic tier only allows 10 timeline requests / 15 min.
+        This method fetches as many as the rate limit allows and stops.
+        Call again later for remaining accounts.
+        
         user_ids: {user_id: username}
         Returns all tweets with author_username attached.
         """
         all_tweets = []
+        skipped = []
 
         for user_id, username in user_ids.items():
-            if not self.credits.can_afford(5):  # minimum per request
-                logger.warning(f"Stopping timeline fetches: credits exhausted "
-                              f"({self.credits.remaining} remaining)")
+            if not self.credits.can_afford(5):
+                logger.warning(f"Credits exhausted ({self.credits.remaining} remaining)")
                 break
+
+            if not self.limiter.can_call("timeline"):
+                skipped.append(username)
+                continue
 
             tweets = self.get_user_timeline(user_id, max_per_user, since_hours)
             for t in tweets:
@@ -185,6 +224,14 @@ class TwitterClient:
             all_tweets.extend(tweets)
 
             logger.info(f"@{username}: {len(tweets)} tweets "
-                       f"(credits remaining: {self.credits.remaining})")
+                       f"(credits: {self.credits.remaining}, "
+                       f"timeline slots: {self.limiter.timeline_slots_remaining})")
+
+            # Small delay between calls
+            time.sleep(0.5)
+
+        if skipped:
+            logger.info(f"Skipped {len(skipped)} accounts (rate limit): "
+                       f"{', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}")
 
         return all_tweets

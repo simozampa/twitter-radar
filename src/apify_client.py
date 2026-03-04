@@ -13,12 +13,12 @@ logger = logging.getLogger("twitter_radar.apify")
 
 # Popular Apify Twitter actors
 ACTORS = {
-    # Tweet scraper by quacker — fast, reliable
-    "tweet_scraper": "quacker/twitter-scraper",
-    # Twitter search scraper
-    "search_scraper": "apidojo/tweet-scraper",
-    # Trending topics
-    "trends": "emastra/twitter-trending-topics",
+    # Primary: apidojo tweet scraper v2
+    "tweet_scraper": "apidojo/tweet-scraper",
+    # Fallback: web.harvester search scraper
+    "search_scraper": "web.harvester/easy-twitter-search-scraper",
+    # User/profile scraper
+    "user_scraper": "apidojo/twitter-user-scraper",
 }
 
 APIFY_BASE = "https://api.apify.com/v2"
@@ -38,7 +38,9 @@ class ApifyTwitterClient:
         """
         Run an Apify actor synchronously and return results.
         """
-        url = f"{APIFY_BASE}/acts/{actor_id}/runs"
+        # Actor ID format: username/actor-name → URL needs username~actor-name
+        actor_url_id = actor_id.replace("/", "~")
+        url = f"{APIFY_BASE}/acts/{actor_url_id}/runs"
         params = {
             "token": self.api_token,
             "timeout": timeout_secs,
@@ -88,24 +90,38 @@ class ApifyTwitterClient:
     def search_tweets(self, queries: list[str], max_tweets: int = 200,
                       since_hours: float = 24, sort_by: str = "Top") -> list:
         """
-        Search tweets using Apify scraper.
-        Much broader than Twitter API — no credit limits on tweet reads.
-        sort_by: "Top" (engagement) or "Latest" (chronological)
+        Search tweets using Apify tweet scraper.
+        Uses Twitter advanced search syntax.
+        Cost: ~$0.40 per 1,000 tweets.
+        sort_by: "Top" or "Latest"
         """
+        # Convert queries to Twitter advanced search format
+        # Each query needs min 50 results on this actor
+        search_terms = []
+        for q in queries:
+            # Add lang:en and min engagement filters
+            search_terms.append(f"{q} lang:en min_faves:50")
+
         input_data = {
-            "searchTerms": queries,
-            "maxTweets": max_tweets,
+            "searchTerms": search_terms,
             "sort": sort_by,
-            "tweetLanguage": "en",
+            "maxItems": max_tweets,
         }
 
-        try:
-            raw_results = self._run_actor(ACTORS["tweet_scraper"], input_data)
-        except Exception as e:
-            logger.error(f"Apify search failed: {e}")
-            return []
+        # Try primary actor, fall back to secondary
+        for actor_key in ["tweet_scraper", "search_scraper"]:
+            actor_id = ACTORS[actor_key]
+            try:
+                raw_results = self._run_actor(actor_id, input_data)
+                if raw_results:
+                    return self._normalize_tweets(raw_results)
+                logger.warning(f"Actor {actor_id} returned no results, trying next")
+            except Exception as e:
+                logger.warning(f"Apify actor {actor_id} failed: {e}, trying next")
+                continue
 
-        return self._normalize_tweets(raw_results)
+        logger.error("All Apify actors failed for search")
+        return []
 
     def get_trending_topics(self, woeid: int = 1) -> list:
         """
