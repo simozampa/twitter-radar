@@ -1,58 +1,50 @@
 # Twitter Trend Radar - Configuration
 # =====================================
+# Architecture:
+#   1. X API timeline (your curated feed, 200 tweets every 4h)
+#   2. Apify trending (broad discovery, 1-2x daily)
+#   3. X API following refresh (monthly)
 
+# OAuth 1.0a for timeline access (zampa0x user context)
+twitter_oauth:
+  api_key: "${TWITTER_API_KEY}"
+  api_secret: "${TWITTER_API_SECRET}"
+  access_token: "${TWITTER_ACCESS_TOKEN}"
+  access_token_secret: "${TWITTER_ACCESS_TOKEN_SECRET}"
+  user_id: "1618325246658088960"
+
+# Bearer token for following list refresh
 twitter:
-  # Your Twitter API Bearer Token
-  bearer_token: "${TWITTER_BEARER_TOKEN}"
-  
-  # Credit budget (usage-based pricing)
-  monthly_credit_limit: 15000
-  
-  # Max tweets to fetch per priority account per scan
-  max_tweets_per_user: 10
+  bearer_token: "${TWITTER_BEARER_TOKEN_ZAMPA0X}"
 
-  # Rate limiting
-  search_rate_limit: 280
-  poll_interval_minutes: 15
+# Timeline settings
+timeline:
+  tweets_per_scan: 200
+  scan_interval_hours: 4
 
-# Apify (scrapes tweets from your following list — no Twitter API credits)
+# Apify (broad trending discovery)
 apify:
   api_token: "${APIFY_API_TOKEN}"
-  # Max tweets per Apify scrape batch
-  max_tweets_per_query: 200
-  # How many accounts to scrape per scan (rotates through full list)
-  accounts_per_scan: 50
+  max_tweets_per_query: 100
 
-# Scraping strategy: pull tweets from ALL accounts you follow,
-# let trend detection cluster topics automatically.
-# No manual categorization needed.
-following:
-  # Your Twitter username (used to pull following list)
-  username: "zampa0x"
-  # How many accounts to scrape per scan (rotates through full list)
-  accounts_per_scan: 100
-  # Minimum followers to include (filters out bots/dead accounts)
-  min_followers: 1000
-  # How often to refresh the following list (hours)
-  refresh_interval_hours: 168  # weekly
+# Trending discovery queries (used by Apify, 1-2x daily)
+trending:
+  queries:
+    - "AI OR LLM OR ChatGPT OR OpenAI OR Anthropic min_faves:500"
+    - "crypto OR bitcoin OR solana OR ethereum OR DeFi min_faves:500"
+    - "prediction market OR polymarket OR kalshi min_faves:100"
+  max_tweets: 100
 
-# Trend detection settings
+# Trend detection
 detection:
-  # Baseline window for comparison (hours)
   baseline_window_hours: 24
-  # Current "trending" window (hours)
   trending_window_hours: 4
-  # Minimum velocity to flag as trending
   min_velocity_score: 2.0
-  # Max trends per community
   max_trends_per_community: 5
-  # Dedup threshold
   dedup_similarity_threshold: 0.75
 
-# Alert settings
+# Alerts
 alerts:
-  digest_interval_minutes: 60
-  # Velocity threshold for push alerts (lower = more alerts)
   alert_velocity_threshold: 3.0
   quiet_hours:
     start: 23
