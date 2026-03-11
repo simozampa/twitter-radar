@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-CLI entry point for Twitter Radar.
-Can be run standalone or called by OpenClaw cron.
+Twitter Radar v2 — LLM-native trend detection.
+
+Fetches tweets, dedupes RTs, scores by engagement+recency,
+outputs the top N tweets for LLM analysis.
 
 Usage:
-  python run_scan.py                    # Full scan + print results
-  python run_scan.py --json             # Output JSON (for cron integration)
-  python run_scan.py --community ai     # Scan specific community only
-  python run_scan.py --dry-run          # Fetch + detect but don't alert
+  python run_scan.py                    # Top tweets, human-readable
+  python run_scan.py --json             # JSON output (for cron/LLM)
+  python run_scan.py --top 60           # Custom number of top tweets
+  python run_scan.py --no-trending      # Skip Apify, timeline only
 """
 
 import sys
@@ -16,10 +18,10 @@ import argparse
 import logging
 from pathlib import Path
 
-# Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.radar import TwitterRadar
+from src.trend_detector import dedup_rts, compute_engagement_score
 
 
 def setup_logging(verbose: bool = False):
@@ -27,16 +29,17 @@ def setup_logging(verbose: bool = False):
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,  # Keep logs out of stdout for --json
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Twitter Trend Radar")
+    parser = argparse.ArgumentParser(description="Twitter Trend Radar v2")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
-    parser.add_argument("--json", action="store_true", help="Output JSON")
-    parser.add_argument("--community", default=None, help="Scan specific community")
-    parser.add_argument("--dry-run", action="store_true", help="Don't send alerts")
+    parser.add_argument("--json", action="store_true", help="Output JSON for LLM")
+    parser.add_argument("--top", type=int, default=60, help="Number of top tweets to output")
+    parser.add_argument("--no-trending", action="store_true", help="Skip Apify trending")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -49,71 +52,59 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Run scan
-    results = radar.run_scan()
+    # Fetch tweets
+    all_tweets = radar.fetch_all(include_trending=not args.no_trending)
 
-    # Filter to specific community if requested
-    if args.community:
-        results = {k: v for k, v in results.items() if k == args.community}
+    # Dedup RTs
+    deduped = dedup_rts(all_tweets)
+    logger.info(f"After RT dedup: {len(all_tweets)} → {len(deduped)} tweets")
+
+    # Score and sort by engagement (recency-weighted)
+    for t in deduped:
+        t['engagement_score'] = compute_engagement_score(t)
+    deduped.sort(key=lambda t: t['engagement_score'], reverse=True)
+
+    # Take top N
+    top = deduped[:args.top]
 
     if args.json:
-        # JSON output for cron/programmatic use
-        output = {}
-        for name, data in results.items():
-            output[name] = {
-                'community_name': data['community_name'],
-                'tweets_fetched': data['tweets_fetched'],
-                'trends': [
-                    {
-                        'topic': t['topic'],
-                        'velocity_score': t['velocity_score'],
-                        'tweet_count': t['tweet_count'],
-                        'total_engagement': t['total_engagement'],
-                        'keywords': t['keywords'][:10],
-                        'top_tweets': [
-                            {
-                                'author': tw.get('author_username', '?'),
-                                'text': tw['text'][:280],
-                                'likes': tw.get('likes', 0),
-                                'retweets': tw.get('retweets', 0),
-                            }
-                            for tw in t.get('top_tweets', [])[:3]
-                        ]
-                    }
-                    for t in data.get('trends', [])
-                ]
-            }
+        output = {
+            'scan_stats': {
+                'total_fetched': len(all_tweets),
+                'after_dedup': len(deduped),
+                'top_returned': len(top),
+                'timeline_count': sum(1 for t in all_tweets if t.get('source') != 'apify'),
+                'apify_count': sum(1 for t in all_tweets if t.get('source') == 'apify'),
+            },
+            'tweets': [
+                {
+                    'author': t.get('display_author', t.get('author_username', '?')),
+                    'text': t.get('original_text', t.get('text', ''))[:500],
+                    'likes': t.get('likes', 0),
+                    'retweets': t.get('retweets', 0),
+                    'replies': t.get('replies', 0),
+                    'quotes': t.get('quotes', 0),
+                    'created_at': t.get('created_at', ''),
+                    'source': t.get('source', ''),
+                    'is_rt': t.get('is_rt', False),
+                    'engagement_score': round(t.get('engagement_score', 0), 1),
+                }
+                for t in top
+            ]
+        }
         print(json.dumps(output, indent=2))
     else:
-        # Human-readable output
-        alert = radar.format_alert(results)
-        if alert:
-            print(alert)
-        else:
-            print("No significant trends detected.")
-
-        # Print summary
-        for name, data in results.items():
-            print(f"\n[{name}] {data['tweets_fetched']} tweets fetched, "
-                  f"{len(data.get('trends', []))} trends detected")
-            for t in data.get('trends', []):
-                print(f"  • {t['topic']} (velocity: {t['velocity_score']:.1f}x, "
-                      f"{t['tweet_count']} tweets)")
-
-    # Generate draft prompts for hottest trend (if any)
-    if not args.dry_run and not args.json:
-        for name, data in results.items():
-            trends = data.get('trends', [])
-            if trends:
-                hottest = trends[0]
-                print(f"\n{'='*60}")
-                print(f"DRAFT PROMPTS for '{hottest['topic']}':")
-                print(f"{'='*60}")
-                prompts = radar.get_draft_prompts(hottest)
-                for p in prompts[:2]:  # Just show first 2
-                    print(f"\n--- {p['style']} ---")
-                    print(p['prompt'][:500])
-                    print("...")
+        print(f"Twitter Radar — {len(all_tweets)} tweets fetched, "
+              f"{len(deduped)} after dedup, showing top {len(top)}\n")
+        for i, t in enumerate(top, 1):
+            author = t.get('display_author', t.get('author_username', '?'))
+            text = t.get('original_text', t.get('text', ''))[:200]
+            likes = t.get('likes', 0)
+            rts = t.get('retweets', 0)
+            score = t.get('engagement_score', 0)
+            rt_flag = " [RT]" if t.get('is_rt') else ""
+            print(f"{i:2d}. @{author}{rt_flag} (♥{likes} ↻{rts} score:{score:.0f})")
+            print(f"    {text}\n")
 
 
 if __name__ == "__main__":

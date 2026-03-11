@@ -71,7 +71,28 @@ STOP_WORDS = {
     "looking", "coming", "taking", "saying", "thinking",
     "true", "false", "full", "free", "based", "post",
     "read", "watch", "check", "follow", "share", "drop",
-    "claim", "believe", "mean", "stop",
+    "claim", "believe", "mean", "stop", "because", "without",
+    "before", "after", "against", "around", "between", "should",
+    "would", "could", "might", "must", "need", "want", "seem",
+    "become", "remain", "happen", "change", "question", "answer",
+    "reason", "talking", "saying", "getting", "making", "being",
+    "having", "doing", "coming", "taking", "looking", "going",
+    "whole", "entire", "another", "different", "same", "small",
+    "large", "second", "third", "possible", "important", "likely",
+    # Twitter-specific noise words
+    "breaking", "built", "daily", "join", "win", "giveaway",
+    "retweet", "quote", "thread", "tweet", "tweets", "viral",
+    "update", "latest", "news", "report", "story", "happening",
+    "massive", "huge", "insane", "crazy", "wild", "holy",
+    "literally", "amazing", "incredible", "unbelievable",
+    "breaking", "developing", "confirmed", "official",
+    "invite", "codes", "code", "airdrop", "whitelist",
+    "winners", "winner", "giveaways", "contest", "raffle",
+    "send", "receive", "address", "wallet",
+    # Verbs/adjectives that sneak into labels
+    "knowingly", "intentionally", "acquiring", "advocating",
+    "company", "officials", "instance", "yesterday", "tomorrow",
+    "today", "tonight", "morning", "evening", "afternoon",
 }
 
 
@@ -130,9 +151,12 @@ def extract_label_entities(text: str) -> list[str]:
         if w1 not in STOP_WORDS and w2 not in STOP_WORDS and len(w1) > 2 and len(w2) > 2:
             entities.append(f"{w1} {w2}")
 
-    # Significant single words
+    # Significant single words (only 4+ chars, skip common verbs/adjectives)
     for w in words:
         if len(w) > 3 and w not in STOP_WORDS:
+            # Skip words that look like common verbs/adjectives (gerunds, past tense)
+            if w.endswith(('ingly', 'edly', 'ally', 'ously', 'ibly')):
+                continue
             entities.append(w)
 
     return entities
@@ -161,7 +185,11 @@ def parse_rt(tweet: dict) -> dict:
 
 
 def dedup_rts(tweets: list) -> list:
-    """Deduplicate RTs — keep highest engagement version."""
+    """
+    Deduplicate RTs — keep highest engagement version.
+    When an RT has 0 likes/replies (typical for RTs), inherit the
+    retweet count as a proxy for engagement so it doesn't look dead.
+    """
     groups = defaultdict(list)
     for t in tweets:
         t = parse_rt(t)
@@ -170,10 +198,37 @@ def dedup_rts(tweets: list) -> list:
 
     deduped = []
     for key, group in groups.items():
-        best = max(group, key=lambda t: compute_engagement_score(t))
+        # Sum up total retweets across all copies
         total_rts = sum(t.get('retweets', 0) for t in group)
+        total_likes = max(t.get('likes', 0) for t in group)
+        total_replies = max(t.get('replies', 0) for t in group)
+        total_quotes = max(t.get('quotes', 0) for t in group)
+
+        # Pick the version with the most engagement data (not the RT with 0s)
+        best = max(group, key=lambda t: (
+            t.get('likes', 0) + t.get('retweets', 0) * 2 +
+            t.get('replies', 0) + t.get('quotes', 0)
+        ))
+        best = dict(best)
+
+        # Propagate the best engagement numbers across all copies
         best['retweets'] = max(best.get('retweets', 0), total_rts)
+        best['likes'] = max(best.get('likes', 0), total_likes)
+        best['replies'] = max(best.get('replies', 0), total_replies)
+        best['quotes'] = max(best.get('quotes', 0), total_quotes)
         best['rt_count'] = len(group)
+
+        # If this is an RT and still shows 0 likes, use retweet count
+        # as a rough engagement signal so it doesn't appear dead
+        if best.get('is_rt') and best.get('likes', 0) == 0 and total_rts > 0:
+            best['likes'] = total_rts  # approximate — better than 0
+
+        # Preserve the original author for display if it's an RT
+        if best.get('is_rt') and best.get('rt_author'):
+            best['display_author'] = best['rt_author']
+        else:
+            best['display_author'] = best.get('author_username', '?')
+
         deduped.append(best)
 
     return deduped
@@ -187,6 +242,7 @@ def compute_engagement_score(tweet: dict) -> float:
     """
     Weighted engagement, normalized by author's reach.
     Small accounts with high engagement = strong signal.
+    Applies recency decay — fresher tweets score higher.
     """
     rt_boost = tweet.get('rt_count', 1)
 
@@ -200,9 +256,30 @@ def compute_engagement_score(tweet: dict) -> float:
     followers = tweet.get('author_followers', 0)
     if followers > 0:
         rate = raw / math.sqrt(followers)
-        return rate * math.log2(max(raw, 2))
+        score = rate * math.log2(max(raw, 2))
     else:
-        return raw
+        score = raw
+
+    # Recency decay: tweets lose value as they age
+    # Half-life of 6 hours — a 12h old tweet scores 25% of a fresh one
+    created = tweet.get('created_at', '')
+    if created:
+        try:
+            from datetime import datetime, timezone
+            if 'T' in created:
+                ts = datetime.fromisoformat(created.replace('Z', '+00:00'))
+            else:
+                from email.utils import parsedate_to_datetime
+                ts = parsedate_to_datetime(created)
+            age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+            if age_hours > 0:
+                half_life = 6.0
+                decay = math.pow(0.5, age_hours / half_life)
+                score *= decay
+        except (ValueError, TypeError):
+            pass
+
+    return score
 
 
 def compute_velocity(current_score: float, baseline_score: float,
@@ -240,7 +317,7 @@ class TrendDetector:
         self.trending_hours = config.get('trending_window_hours', 4)
         self.min_velocity = config.get('min_velocity_score', 2.0)
         self.max_trends = config.get('max_trends_per_community', 10)
-        self.min_cluster_size = config.get('min_cluster_size', 5)
+        self.min_cluster_size = config.get('min_cluster_size', 4)
 
     def detect_trends(self, current_tweets: list, baseline_tweets: list,
                       community: str) -> list[dict]:
@@ -284,11 +361,12 @@ class TrendDetector:
 
         # Step 3: Cluster with HDBSCAN
         # min_cluster_size controls granularity — smaller = more clusters
+        # min_samples=1 lets it find tighter, smaller groups
         clusterer = hdb.HDBSCAN(
             min_cluster_size=max(self.min_cluster_size, 3),
-            min_samples=2,
+            min_samples=1,
             metric='euclidean',
-            cluster_selection_method='eom',  # excess of mass — good for varied densities
+            cluster_selection_method='leaf',  # leaf finds more fine-grained clusters than eom
         )
         labels = clusterer.fit_predict(embeddings)
 
@@ -345,6 +423,38 @@ class TrendDetector:
             if len(cluster_tweets) < self.min_cluster_size:
                 continue
 
+            # --- Spam detection ---
+            # If >40% of tweets mention the same @handle (excluding RTs), likely spam
+            mention_counter = Counter()
+            for t in cluster_tweets:
+                text = t.get('original_text', t.get('text', ''))
+                mentions = re.findall(r'@(\w+)', text)
+                for m in mentions:
+                    mention_counter[m.lower()] += 1
+            if mention_counter:
+                top_mention, top_count = mention_counter.most_common(1)[0]
+                if top_count > len(cluster_tweets) * 0.4:
+                    # Check if it's just a popular RT source vs spam promotion
+                    promo_signals = sum(1 for t in cluster_tweets
+                        if any(w in t.get('original_text', '').lower()
+                            for w in ['follow', 'giveaway', 'win', 'join', 'invite',
+                                      'airdrop', 'whitelist', 'contest', 'raffle',
+                                      'free', 'claim', 'reward']))
+                    if promo_signals > len(cluster_tweets) * 0.3:
+                        logger.info(f"Skipping spam cluster: @{top_mention} in {top_count}/{len(cluster_tweets)} tweets, {promo_signals} promo signals")
+                        continue
+
+            # Check for duplicate message structure (bot spam)
+            text_starts = Counter()
+            for t in cluster_tweets:
+                text = t.get('original_text', t.get('text', ''))[:60].lower().strip()
+                text_starts[text] += 1
+            if text_starts:
+                top_start, top_start_count = text_starts.most_common(1)[0]
+                if top_start_count > len(cluster_tweets) * 0.5 and len(cluster_tweets) > 3:
+                    logger.info(f"Skipping bot cluster: {top_start_count}/{len(cluster_tweets)} tweets start with '{top_start[:40]}...'")
+                    continue
+
             # Total engagement for this cluster
             total_engagement = sum(compute_engagement_score(t) for t in cluster_tweets)
 
@@ -360,22 +470,58 @@ class TrendDetector:
                 continue
 
             # Label: extract entities from all tweets, pick top ones
+            # Prioritize: named entities (capitalized), hashtags, cashtags > generic bigrams
             entity_counter = Counter()
+            named_entity_counter = Counter()
             for t in cluster_tweets:
-                entities = extract_label_entities(t.get('original_text', t.get('text', '')))
+                text = t.get('original_text', t.get('text', ''))
+                entities = extract_label_entities(text)
                 for e in entities:
                     entity_counter[e] += 1
+                # Extract proper nouns (capitalized words not at sentence start)
+                words = text.split()
+                for i, w in enumerate(words):
+                    clean_w = re.sub(r'[^a-zA-Z]', '', w)
+                    if (clean_w and clean_w[0].isupper() and len(clean_w) > 2
+                            and clean_w.lower() not in STOP_WORDS
+                            and i > 0):  # skip sentence-initial caps
+                        named_entity_counter[clean_w] += 1
 
-            # Pick top 3 entities that appear in >20% of cluster tweets
-            min_freq = max(2, len(cluster_tweets) * 0.2)
-            top_entities = [
-                e for e, c in entity_counter.most_common(10)
-                if c >= min_freq
-            ][:3]
+            # Build label: prefer hashtags/cashtags/proper nouns, then bigrams
+            min_freq = max(2, len(cluster_tweets) * 0.15)
+
+            # Tier 1: hashtags and cashtags
+            tier1 = [e for e, c in entity_counter.most_common(20)
+                     if c >= min_freq and e.startswith(('$', '#'))][:2]
+
+            # Tier 2: proper nouns that appear frequently
+            tier2 = [e for e, c in named_entity_counter.most_common(10)
+                     if c >= min_freq and e not in {t.lstrip('#$') for t in tier1}][:2]
+
+            # Tier 3: bigrams — but only if both words are meaningful
+            used = {t.lstrip('#$@').lower() for t in tier1 + tier2}
+            tier3 = []
+            for e, c in entity_counter.most_common(30):
+                if c < min_freq or e.lower() in used or not ' ' in e:
+                    continue
+                if e.startswith('@'):
+                    continue
+                # Both words in bigram must not be stop words
+                parts = e.split()
+                if all(p not in STOP_WORDS and len(p) > 2 for p in parts):
+                    tier3.append(e)
+                if len(tier3) >= 2:
+                    break
+
+            top_entities = (tier1 + tier2 + tier3)[:3]
 
             if not top_entities:
-                # Fallback: just use the top 3 most common
-                top_entities = [e for e, _ in entity_counter.most_common(3)]
+                # Fallback: top proper nouns, then single keywords
+                top_entities = [e for e, c in named_entity_counter.most_common(3) if c >= 2]
+                if not top_entities:
+                    top_entities = [e for e, c in entity_counter.most_common(5)
+                                   if e not in STOP_WORDS and not e.startswith('@')
+                                   and len(e) > 3][:3]
 
             trend_name = " / ".join(
                 e.title() if not e.startswith(('$', '#', '@')) and ' ' not in e else e

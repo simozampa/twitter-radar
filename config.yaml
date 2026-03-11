@@ -27,21 +27,28 @@ apify:
   api_token: "${APIFY_API_TOKEN}"
   max_tweets_per_query: 100
 
-# Trending discovery queries (used by Apify, 1-2x daily)
+# Trending discovery queries (used by Apify, every scan)
+# NOTE: min_faves filters are applied here; since: date is added automatically
+# by the apify_client based on since_hours below
 trending:
+  since_hours: 12  # Only fetch tweets from last 12 hours (prevents stale viral tweets)
+  sort: "Latest"   # Latest for freshness, not Top (which biases toward old viral tweets)
   queries:
     - "AI OR LLM OR ChatGPT OR OpenAI OR Anthropic min_faves:500"
     - "crypto OR bitcoin OR solana OR ethereum OR DeFi min_faves:500"
     - "prediction market OR polymarket OR kalshi min_faves:100"
-  max_tweets: 100
+    - "breaking OR just in OR developing min_faves:1000"
+    - "tech OR startup OR founder min_faves:500"
+    - "market OR stocks OR economy OR tariff min_faves:500"
+  max_tweets: 500
 
 # Trend detection
 detection:
   baseline_window_hours: 24
   trending_window_hours: 4
-  min_velocity_score: 1.5
+  min_velocity_score: 2.0
   max_trends_per_community: 10
-  min_cluster_size: 3
+  min_cluster_size: 5
 
 # Alerts
 alerts:

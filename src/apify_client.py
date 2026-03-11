@@ -88,19 +88,23 @@ class ApifyTwitterClient:
         return resp.json()
 
     def search_tweets(self, queries: list[str], max_tweets: int = 200,
-                      since_hours: float = 24, sort_by: str = "Top") -> list:
+                      since_hours: float = 24, sort_by: str = "Latest") -> list:
         """
         Search tweets using Apify tweet scraper.
         Uses Twitter advanced search syntax.
         Cost: ~$0.40 per 1,000 tweets.
         sort_by: "Top" or "Latest"
+        since_hours: Only fetch tweets from the last N hours (uses since: operator)
         """
+        from datetime import datetime, timedelta, timezone
+        # Calculate since date for freshness filter
+        since_date = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).strftime('%Y-%m-%d')
+
         # Convert queries to Twitter advanced search format
-        # Each query needs min 50 results on this actor
         search_terms = []
         for q in queries:
-            # Add lang:en and min engagement filters
-            search_terms.append(f"{q} lang:en min_faves:50")
+            # Add lang:en, since date, and min engagement filters
+            search_terms.append(f"{q} lang:en since:{since_date}")
 
         input_data = {
             "searchTerms": search_terms,
